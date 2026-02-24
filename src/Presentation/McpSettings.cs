@@ -213,21 +213,14 @@ namespace dnSpy.MCP.Server.Presentation {
 		}
 
 		/// <summary>
-		/// Sets the server instance for dynamic control.
-		/// If the settings already indicate the server should be enabled, start it immediately.
+		/// Stores the server reference so that property-change events (Enable/Disable toggle)
+		/// can control the server lifecycle at runtime.
+		/// The initial start is deferred to the AppLoaded event in TheExtension so that
+		/// all MEF services and documents are fully initialized before the server begins
+		/// accepting connections.
 		/// </summary>
 		internal override void SetServer(McpServer server) {
 			mcpServer = server;
-			try {
-				if (mcpServer != null && EnableServer) {
-					// Log and attempt to start - Start() is idempotent if already running
-					Log("EnableServer=true on settings; starting MCP server from SetServer()");
-					mcpServer.Start();
-				}
-			}
-			catch (Exception ex) {
-				Log($"ERROR while starting server from SetServer(): {ex.GetType().Name}: {ex.Message}");
-			}
 		}
 
 		void McpSettingsImpl_PropertyChanged(object? sender, PropertyChangedEventArgs e) {

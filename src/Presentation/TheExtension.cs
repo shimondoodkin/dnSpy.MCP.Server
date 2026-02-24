@@ -91,11 +91,11 @@ namespace dnSpy.MCP.Server.Presentation {
 
 			if (@event == ExtensionEvent.AppLoaded) {
 				if (mcpSettings.EnableServer) {
-					McpLogger.Info("AppLoaded event - ensuring MCP server is running (EnableServer=True)");
+					McpLogger.Info("AppLoaded: all services ready — starting MCP server");
 					mcpServer.Start();
 				}
 				else {
-					McpLogger.Info("AppLoaded event - MCP server disabled via settings");
+					McpLogger.Info("AppLoaded: MCP server is disabled in settings");
 				}
 			}
 			else if (@event == ExtensionEvent.AppExit) {
