@@ -1,144 +1,90 @@
-# dnSpy MCP Server - Release v1.0.0
+# dnSpy MCP Server — Release Notes
 
-## Overview
-This is the initial release of dnSpy MCP Server, a Model Context Protocol (MCP) server that exposes dnSpy's .NET assembly analysis capabilities to AI assistants.
+---
 
-## What's New
+## v1.2.0 — 2026-02-24
 
-### First Release
-- ✅ MCP server integration with dnSpy
-- ✅ 15 tools for assembly analysis
-- ✅ HTTP/SSE protocol support
-- ✅ Multi-target: .NET Framework 4.8 + .NET 10.0
+### New: Memory Dump Tools
 
-## Installation
+Three new tools to extract data from running processes.
 
-### Prerequisites
-- dnSpy (latest version)
-- .NET Framework 4.8 SDK or .NET 10.0 SDK
+| Tool | Description |
+|------|-------------|
+| `list_runtime_modules` | Enumerate all .NET modules in every debugged process, with base address, size, `IsDynamic`, `IsInMemory`, and AppDomain |
+| `dump_module_from_memory` | Extract a .NET module from process memory to disk. Uses `IDbgDotNetRuntime.GetRawModuleBytes` (file layout, preferred) with automatic fallback to `DbgProcess.ReadMemory` |
+| `read_process_memory` | Read raw bytes from any process address (1–65 536 bytes); returns a formatted hex dump and Base64 payload |
 
-### Steps
-1. Copy the compiled DLL to your dnSpy extensions folder:
-   - For .NET Framework 4.8: `dnSpy/dnSpy/bin/Release/net48/dnSpy.MCP.Server.x.dll`
-   - For .NET 10.0: `dnSpy/dnSpy/bin/Release/net10.0-windows/dnSpy.MCP.Server.x.dll`
+### Previously-hidden tools now exposed
 
-2. Start dnSpy - the MCP server will automatically start on `http://localhost:3100`
+Four tools that existed in the codebase but lacked MCP schemas and dispatch entries:
 
-3. Configure your MCP client to connect to the server
+| Tool | Description |
+|------|-------------|
+| `get_type_fields` | List fields in a type with glob/regex pattern filtering |
+| `get_type_property` | Detailed property info: getter/setter signatures and custom attributes |
+| `find_path_to_type` | BFS traversal of property/field references to trace how one type reaches another |
+| `list_native_modules` | All native DLLs imported via `[DllImport]`, grouped by DLL name |
 
-## MCP Client Configuration
+### Improvements
 
-### OpenCode
-```json
-{
-  "mcpServers": {
-    "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100"
-    }
-  }
-}
-```
+- **Glob and regex support** added to `list_types` (`name_pattern`), `list_methods_in_type` (`name_pattern`), and `list_runtime_modules` (`name_filter`). Auto-detects regex (`^ $ [ ( | + {`) vs glob (`* ?`).
+- **Default page size** raised from 10 → **50** items across all paginated tools.
+- Tool descriptions updated to include pattern syntax examples.
 
-### Claude Code CLI
-```json
-{
-  "mcpServers": {
-    "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100"
-    }
-  }
-}
-```
+### Total tools: **38**
 
-### Codex CLI
-```json
-{
-  "mcpServers": {
-    "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100",
-      "timeout": 30
-    }
-  }
-}
-```
+---
 
-### Gemini CLI
-```yaml
-mcpServers:
-  dnspy:
-    type: streamable-http
-    url: http://localhost:3100
-```
+## v1.1.0 — 2026-02-24
 
-### Kilo Code
-```json
-{
-  "mcpServers": {
-    "dnspy-mcp": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100",
-      "alwaysAllow": ["list_assemblies", "list_tools", "search_types", "get_type_info"],
-      "disabled": false
-    }
-  }
-}
-```
+### New: Edit Tools (7)
 
-### Roo Code
-```json
-{
-  "mcpServers": {
-    "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100",
-      "alwaysAllow": ["list_assemblies", "list_tools"]
-    }
-  }
-}
-```
+| Tool | Description |
+|------|-------------|
+| `decompile_type` | Decompile an entire type to C# source |
+| `change_member_visibility` | Change access modifier of a type or member |
+| `rename_member` | Rename a type, method, field, property, or event |
+| `save_assembly` | Save modified assembly to disk |
+| `list_events_in_type` | List all events in a type |
+| `get_custom_attributes` | Get custom attributes on a type or member |
+| `list_nested_types` | Recursively list all nested types |
 
-## Available Tools
+### New: Debug Tools (9)
 
-### Assembly Tools
-- `list_assemblies` - List all loaded assemblies
-- `get_assembly_info` - Get detailed assembly information
+| Tool | Description |
+|------|-------------|
+| `get_debugger_state` | Current debugger state and process list |
+| `list_breakpoints` | All registered breakpoints |
+| `set_breakpoint` | Add a breakpoint at a method/IL offset |
+| `remove_breakpoint` | Remove a specific breakpoint |
+| `clear_all_breakpoints` | Remove all breakpoints |
+| `continue_debugger` | Resume all paused processes |
+| `break_debugger` | Pause all running processes |
+| `stop_debugging` | Stop all debug sessions |
+| `get_call_stack` | Call stack of the current thread |
 
-### Type Tools
-- `list_types` - List all types in an assembly
-- `get_type_info` - Get detailed type information
-- `search_types` - Search for types by name
+### Other
+- Added `dnSpy.Contracts.Debugger.DotNet` project reference for `DbgDotNetBreakpointFactory`.
+- Fixed `NativeModuleWriterOptions` to correctly cast `ModuleDef → ModuleDefMD`.
 
-### Method Tools
-- `decompile_method` - Decompile a method to C#
-- `list_methods_in_type` - List all methods in a type
-- `get_method_signature` - Get method signature
+### Total tools: **31**
 
-### Property Tools
-- `list_properties_in_type` - List all properties in a type
+---
 
-### Analysis Tools
-- `find_who_calls_method` - Find methods that call a specific method
-- `analyze_type_inheritance` - Analyze type inheritance chain
+## v1.0.0 — 2026-02-24
 
-### IL Tools
-- `get_method_il` - Get IL instructions
-- `get_method_il_bytes` - Get raw IL bytes
-- `get_method_exception_handlers` - Get exception handlers
+### Initial release
 
-### Utility Tools
-- `list_tools` - List all available tools
+15 tools covering assembly discovery, type/method inspection, decompilation, IL analysis, usage finding, and inheritance analysis.
 
-## Troubleshooting
+| Category | Tools |
+|----------|-------|
+| Assembly | `list_assemblies`, `get_assembly_info` |
+| Type | `list_types`, `get_type_info`, `search_types` |
+| Method | `decompile_method`, `list_methods_in_type`, `get_method_signature` |
+| Property | `list_properties_in_type` |
+| Analysis | `find_who_calls_method`, `analyze_type_inheritance` |
+| IL | `get_method_il`, `get_method_il_bytes`, `get_method_exception_handlers` |
+| Utility | `list_tools` |
 
-| Issue | Solution |
-|-------|----------|
-| Extension not loading | Check output folder matches dnSpy location |
-| Server won't start | Port 3100 in use? Check `netstat -ano \| findstr :3100` |
-| Command not found | Call `list_tools` to verify available commands |
-| Type not found | Use `list_assemblies` then `search_types` |
-
-## License
-This project is licensed under the GNU General Public License v3.0. See LICENSE file for details.
+**Protocol**: MCP 2024-11-05 | **Transport**: HTTP/SSE | **Targets**: net48 + net10.0-windows
