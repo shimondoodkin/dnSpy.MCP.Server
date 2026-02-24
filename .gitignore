@@ -39,3 +39,7 @@ appsettings.local.json
 
 # OS files
 Thumbs.db
+
+# Other
+AGENTS.md
+.agent/

@@ -618,5 +618,233 @@ namespace dnSpy.MCP.Server.Application
                 }
             };
         }
+
+        public CallToolResult GetMethodIL(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null)
+                throw new ArgumentException("Arguments required");
+            if (!arguments.TryGetValue("assembly_name", out var assemblyNameObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("method_name", out var methodNameObj))
+                throw new ArgumentException("method_name is required");
+
+            var assemblyName = assemblyNameObj.ToString() ?? string.Empty;
+            var typeFullName = typeNameObj.ToString() ?? string.Empty;
+            var methodName = methodNameObj.ToString() ?? string.Empty;
+
+            var assembly = FindAssemblyByName(assemblyName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+            var type = FindTypeInAssembly(assembly, typeFullName);
+            if (type == null)
+                throw new ArgumentException($"Type not found: {typeFullName}");
+
+            var method = type.Methods.FirstOrDefault(m => m.Name.String == methodName);
+            if (method == null)
+                throw new ArgumentException($"Method not found: {methodName}");
+
+            if (method.Body == null)
+                throw new ArgumentException($"Method has no body (abstract or native)");
+
+            var instructions = method.Body.Instructions;
+            var ilInstructions = new List<object>();
+
+            foreach (var instr in instructions)
+            {
+                var ilInstr = new Dictionary<string, object>
+                {
+                    ["offset"] = instr.Offset,
+                    ["opcode"] = instr.OpCode.Name,
+                    ["operand"] = GetOperandString(instr)
+                };
+                ilInstructions.Add(ilInstr);
+            }
+
+            var locals = new List<object>();
+            if (method.Body.Variables != null)
+            {
+                foreach (var local in method.Body.Variables)
+                {
+                    locals.Add(new
+                    {
+                        Index = local.Index,
+                        Type = local.Type.FullName,
+                        Name = local.Name ?? $"V_{local.Index}"
+                    });
+                }
+            }
+
+            var result = JsonSerializer.Serialize(new
+            {
+                Method = method.FullName,
+                MaxStack = method.Body.MaxStack,
+                LocalVarCount = method.Body.Variables?.Count ?? 0,
+                Locals = locals,
+                Instructions = ilInstructions,
+                InstructionCount = instructions.Count
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult
+            {
+                Content = new List<ToolContent> { new ToolContent { Text = result } }
+            };
+        }
+
+        public CallToolResult GetMethodILBytes(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null)
+                throw new ArgumentException("Arguments required");
+            if (!arguments.TryGetValue("assembly_name", out var assemblyNameObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("method_name", out var methodNameObj))
+                throw new ArgumentException("method_name is required");
+
+            var assemblyName = assemblyNameObj.ToString() ?? string.Empty;
+            var typeFullName = typeNameObj.ToString() ?? string.Empty;
+            var methodName = methodNameObj.ToString() ?? string.Empty;
+
+            var assembly = FindAssemblyByName(assemblyName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+            var type = FindTypeInAssembly(assembly, typeFullName);
+            if (type == null)
+                throw new ArgumentException($"Type not found: {typeFullName}");
+
+            var method = type.Methods.FirstOrDefault(m => m.Name.String == methodName);
+            if (method == null)
+                throw new ArgumentException($"Method not found: {methodName}");
+
+            if (method.Body == null)
+                throw new ArgumentException($"Method has no body (abstract or native)");
+
+            var cilBody = method.Body;
+            var instructions = cilBody.Instructions;
+            var bytes = new List<byte>();
+            foreach (var instr in instructions)
+            {
+                var opcode = instr.OpCode;
+                var code = opcode.Code;
+                if (code >= dnlib.DotNet.Emit.Code.Nop)
+                {
+                    if ((int)code > 255)
+                    {
+                        bytes.Add(0xFE);
+                        bytes.Add((byte)((int)code - 256));
+                    }
+                    else
+                    {
+                        bytes.Add((byte)code);
+                    }
+                }
+            }
+            var byteArray = bytes.ToArray();
+            var hexString = BitConverter.ToString(byteArray).Replace("-", " ");
+
+            var result = JsonSerializer.Serialize(new
+            {
+                Method = method.FullName,
+                ByteCount = byteArray?.Length ?? 0,
+                ILBytes = hexString,
+                ILBytesBase64 = byteArray != null ? Convert.ToBase64String(byteArray) : ""
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult
+            {
+                Content = new List<ToolContent> { new ToolContent { Text = result } }
+            };
+        }
+
+        public CallToolResult GetMethodExceptionHandlers(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null)
+                throw new ArgumentException("Arguments required");
+            if (!arguments.TryGetValue("assembly_name", out var assemblyNameObj))
+                throw new ArgumentException("assembly_name is required");
+            if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
+                throw new ArgumentException("type_full_name is required");
+            if (!arguments.TryGetValue("method_name", out var methodNameObj))
+                throw new ArgumentException("method_name is required");
+
+            var assemblyName = assemblyNameObj.ToString() ?? string.Empty;
+            var typeFullName = typeNameObj.ToString() ?? string.Empty;
+            var methodName = methodNameObj.ToString() ?? string.Empty;
+
+            var assembly = FindAssemblyByName(assemblyName);
+            if (assembly == null)
+                throw new ArgumentException($"Assembly not found: {assemblyName}");
+
+            var type = FindTypeInAssembly(assembly, typeFullName);
+            if (type == null)
+                throw new ArgumentException($"Type not found: {typeFullName}");
+
+            var method = type.Methods.FirstOrDefault(m => m.Name.String == methodName);
+            if (method == null)
+                throw new ArgumentException($"Method not found: {methodName}");
+
+            if (method.Body == null)
+                throw new ArgumentException($"Method has no body (abstract or native)");
+
+            var handlers = new List<object>();
+            foreach (var eh in method.Body.ExceptionHandlers)
+            {
+                handlers.Add(new
+                {
+                    HandlerType = eh.HandlerType.ToString(),
+                    TryStart = (int)(eh.TryStart?.Offset ?? 0),
+                    TryEnd = (int)(eh.TryEnd?.Offset ?? 0),
+                    HandlerStart = (int)(eh.HandlerStart?.Offset ?? 0),
+                    HandlerEnd = (int)(eh.HandlerEnd?.Offset ?? 0),
+                    CatchType = eh.CatchType?.FullName ?? "null",
+                    FilterStart = eh.FilterStart != null ? (int)eh.FilterStart.Offset : -1
+                });
+            }
+
+            var result = JsonSerializer.Serialize(new
+            {
+                Method = method.FullName,
+                ExceptionHandlerCount = handlers.Count,
+                ExceptionHandlers = handlers
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            return new CallToolResult
+            {
+                Content = new List<ToolContent> { new ToolContent { Text = result } }
+            };
+        }
+
+        string GetOperandString(dnlib.DotNet.Emit.Instruction instr)
+        {
+            if (instr.Operand == null)
+                return "";
+            
+            if (instr.Operand is MethodDef md)
+                return md.FullName;
+            if (instr.Operand is FieldDef fd)
+                return fd.FullName;
+            if (instr.Operand is TypeDef td)
+                return td.FullName;
+            if (instr.Operand is MemberRef mr)
+                return mr.FullName;
+            if (instr.Operand is string s)
+                return $"\"{s}\"";
+            if (instr.Operand is ITypeDefOrRef tdor)
+                return tdor.FullName;
+            if (instr.Operand is MethodSpec ms)
+                return ms.FullName;
+            if (instr.Operand is ParamDef pd)
+                return pd.Name;
+            if (instr.Operand is dnlib.DotNet.Emit.Instruction target)
+                return $"IL_{target.Offset:X4}";
+            if (instr.Operand is dnlib.DotNet.Emit.Instruction[] targets)
+                return string.Join(", ", targets.Select(t => $"IL_{t.Offset:X4}"));
+            
+            return instr.Operand.ToString() ?? "";
+        }
     }
 }

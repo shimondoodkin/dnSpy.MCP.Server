@@ -53,7 +53,7 @@ namespace dnSpy.MCP.Server.Presentation {
 		string host = "localhost";
 
 		/// <summary>
-		/// Gets or sets the server port (default: 3000).
+		/// Gets or sets the server port (default: 3100 - to avoid conflicts with Docker/Node).
 		/// </summary>
 		public int Port {
 			get => port;
@@ -64,7 +64,7 @@ namespace dnSpy.MCP.Server.Presentation {
 				}
 			}
 		}
-		int port = 3000;
+		int port = 3100;
 
 		/// <summary>
 		/// Gets the collection of log messages (limited to last 100 messages).

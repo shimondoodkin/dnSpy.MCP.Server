@@ -77,37 +77,82 @@ namespace dnSpy.MCP.Server.Communication {
 
 		void StartHttpListenerServer() {
 			Task.Run(() => {
-				try {
-					McpLogger.Debug("Creating HttpListener");
+				int port = settings.Port;
+				int maxAttempts = 10;
+				HttpListener? listener = null;
+				string? boundPrefix = null;
 
-					httpListener = new HttpListener();
-					// Bind only to localhost to avoid exposing the admin API on network interfaces.
-					var prefix = $"http://localhost:{settings.Port}/";
-					httpListener.Prefixes.Add(prefix);
-					httpListener.Start();
+				for (int attempt = 0; attempt < maxAttempts; attempt++) {
+					try {
+						int currentPort = port + attempt;
+						McpLogger.Debug($"Attempting to start HTTP server on port {currentPort}");
 
-					McpLogger.Info($"HttpListener server started on localhost:{settings.Port}");
-					McpLogger.Info("Server is ready to accept connections");
-					BroadcastStatus("running");
-
-					while (!cts!.Token.IsCancellationRequested) {
+						listener = new HttpListener();
+						boundPrefix = $"http://localhost:{currentPort}/";
+						
 						try {
-							var context = httpListener.GetContext();
-							McpLogger.Debug($"Accepted connection from {context.Request.RemoteEndPoint}");
-							Task.Run(() => HandleHttpRequest(context), cts.Token);
+							listener.Prefixes.Add(boundPrefix);
 						}
-						catch (HttpListenerException) {
-							McpLogger.Debug("HttpListener stopped (expected during shutdown)");
-							break; // Listener was stopped
+						catch (HttpListenerException ex) {
+							McpLogger.Debug($"Failed to add prefix {boundPrefix}: {ex.Message}");
+							listener.Close();
+							listener = null;
+							continue;
 						}
-						catch (Exception ex) {
-							McpLogger.Exception(ex, "Error accepting HTTP request");
+						
+						listener.Start();
+						
+						// Success!
+						port = currentPort;
+						httpListener = listener;
+						
+						McpLogger.Info($"HttpListener server started on localhost:{port}");
+						
+						if (attempt > 0) {
+							McpLogger.Info($"Note: Original port {settings.Port} was in use, using port {port} instead");
 						}
+						
+						McpLogger.Info("Server is ready to accept connections");
+						BroadcastStatus("running");
+						break;
+					}
+					catch (HttpListenerException ex) when (ex.ErrorCode == 5) {
+						// Access denied - no point trying other ports
+						McpLogger.Exception(ex, $"Access denied to port {port}. Try running: netsh http add urlacl url=http://localhost:{port}/ user=Everyone");
+						break;
+					}
+					catch (HttpListenerException) {
+						// Port in use, try next one
+						McpLogger.Debug($"Port {port + attempt} is in use, trying next...");
+						listener?.Close();
+						listener = null;
+					}
+					catch (Exception ex) {
+						McpLogger.Exception(ex, $"Error starting HttpListener on port {port + attempt}");
+						listener?.Close();
+						listener = null;
+						break;
 					}
 				}
-				catch (Exception ex) {
-					McpLogger.Exception(ex, "Error starting HttpListener");
-					httpListener = null;
+
+				if (httpListener == null) {
+					McpLogger.Error($"Failed to start HTTP server after {maxAttempts} attempts");
+					return;
+				}
+
+				while (!cts!.Token.IsCancellationRequested) {
+					try {
+						var context = httpListener.GetContext();
+						McpLogger.Debug($"Accepted connection from {context.Request.RemoteEndPoint}");
+						Task.Run(() => HandleHttpRequest(context), cts.Token);
+					}
+					catch (HttpListenerException) {
+						McpLogger.Debug("HttpListener stopped (expected during shutdown)");
+						break;
+					}
+					catch (Exception ex) {
+						McpLogger.Exception(ex, "Error accepting HTTP request");
+					}
 				}
 			}, cts!.Token);
 		}
@@ -238,12 +283,28 @@ namespace dnSpy.MCP.Server.Communication {
 			McpLogger.Info("Stopping MCP server...");
 			try {
 				cts?.Cancel();
-				httpListener?.Stop();
-				httpListener?.Close();
-				httpListener = null;
-				McpLogger.Info("MCP server stopped successfully");
+				
+				// Force close the HttpListener to release the port
+				if (httpListener != null) {
+					try {
+						httpListener.Stop();
+					}
+					catch { }
+					try {
+						httpListener.Abort();
+					}
+					catch { }
+					httpListener.Close();
+					httpListener = null;
+				}
+				
 				CloseAllSseClients();
 				BroadcastStatus("stopped");
+				
+				// Small delay to ensure port is released
+				Thread.Sleep(100);
+				
+				McpLogger.Info("MCP server stopped successfully");
 				cts?.Dispose();
 				cts = null;
 			}

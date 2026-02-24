@@ -14,21 +14,18 @@
   <ItemGroup>
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.DnSpy\dnSpy.Contracts.DnSpy.csproj" />
     <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Logic\dnSpy.Contracts.Logic.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger\dnSpy.Contracts.Debugger.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
     <PackageReference Include="Microsoft.VisualStudio.Text.UI.Wpf" Version="$(MSVSTextVersion)" />
+    <PackageReference Include="ModelContextProtocol" Version="0.9.0-preview.2" />
   </ItemGroup>
 
   <!-- For .NET Framework 4.8, we'll use a simpler HTTP listener approach -->
   <ItemGroup Condition=" '$(IsDotNetFramework)' == 'true' ">
     <PackageReference Include="Newtonsoft.Json" Version="$(NewtonsoftJsonVersion)" />
-  </ItemGroup>
-
-  <!-- System.Text.Json for both targets -->
-  <ItemGroup>
-    <PackageReference Include="System.Text.Json" Version="8.0.5" Condition=" '$(IsDotNet)' == 'true' " />
-    <PackageReference Include="System.Text.Json" Version="8.0.5" Condition=" '$(IsDotNetFramework)' == 'true' " />
   </ItemGroup>
 
   <!-- Exclude backup and docs directories from implicit SDK compile items -->
