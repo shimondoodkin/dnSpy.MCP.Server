@@ -2,7 +2,7 @@
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedded in dnSpy that exposes full .NET assembly analysis, editing, debugging, memory-dump, and deobfuscation capabilities to any MCP-compatible AI assistant.
 
-**Version**: 1.3.0 | **Tools**: 67 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
+**Version**: 1.3.0 | **Tools**: 80 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
 
 ---
 
@@ -18,6 +18,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
    - [IL Tools](#il-tools)
    - [Analysis & Cross-Reference Tools](#analysis--cross-reference-tools)
    - [Edit Tools](#edit-tools)
+   - [Embedded Resource Tools](#embedded-resource-tools)
    - [Debug Tools](#debug-tools)
    - [Memory Dump & PE Tools](#memory-dump--pe-tools)
    - [Static PE Analysis](#static-pe-analysis)
@@ -43,10 +44,11 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
 | **IL** | View IL instructions, raw bytes, local variables, exception handlers |
 | **Analysis** | Find callers/users, trace field reads/writes, call graphs, dead code, cross-assembly dependencies |
 | **Edit** | Rename members, change access modifiers, edit metadata, patch methods, inject types, save to disk |
+| **Resources** | List, read, add, remove embedded resources (ManifestResource table); extract Costura.Fody-embedded assemblies |
 | **Debug** | Manage breakpoints, launch/attach processes, pause/resume/stop sessions, inspect call stacks, read locals |
 | **Memory Dump** | List runtime modules, dump .NET or native modules from memory, read process memory, extract PE sections |
 | **Static PE Analysis** | Scan raw PE bytes for strings; all-in-one ConfuserEx unpacker |
-| **Deobfuscation** | de4dot integration: detect obfuscator, rename mangled symbols, decrypt strings (.NET 4.8 only) |
+| **Deobfuscation** | de4dot integration: detect obfuscator, rename mangled symbols, decrypt strings. Both in-process (`deobfuscate_assembly`) and external process (`run_de4dot`) modes available in all builds |
 | **Search** | Glob and regex search across all loaded assemblies |
 
 ---
@@ -113,23 +115,33 @@ dotnet build Extensions/dnSpy.MCP.Server/dnSpy.MCP.Server.csproj -c Release --no
 ### Runtime
 
 1. Start dnSpy — the MCP server starts automatically on `http://localhost:3100`
-2. Verify it is running: `curl http://localhost:3100/health` or open in a browser
+2. Verify it is running:
+   ```bash
+   curl http://localhost:3100/health
+   curl -N --max-time 3 http://localhost:3100/sse   # should print event: endpoint
+   ```
 3. Configure your MCP client (see next section)
 
 ---
 
 ## Client Configuration
 
-The server uses the **Streamable HTTP** MCP transport. Add the following snippet to your client's MCP configuration file.
+The server implements the **MCP SSE transport** (spec version 2024-11-05). On connect the server sends an `event: endpoint` with the per-session POST URL; responses are pushed back over the SSE stream.
 
-### Claude Code / Claude Desktop
+### Claude Code (CLI)
+
+```bash
+claude mcp add dnspy --transport sse http://localhost:3100/sse
+```
+
+### Claude Desktop
 
 ```json
 {
   "mcpServers": {
     "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100"
+      "type": "sse",
+      "url": "http://localhost:3100/sse"
     }
   }
 }
@@ -141,8 +153,8 @@ The server uses the **Streamable HTTP** MCP transport. Add the following snippet
 {
   "mcpServers": {
     "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100"
+      "type": "sse",
+      "url": "http://localhost:3100/sse"
     }
   }
 }
@@ -154,8 +166,8 @@ The server uses the **Streamable HTTP** MCP transport. Add the following snippet
 {
   "mcpServers": {
     "dnspy-mcp": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100",
+      "type": "sse",
+      "url": "http://localhost:3100/sse",
       "alwaysAllow": [
         "list_assemblies", "list_tools", "search_types",
         "get_type_info", "list_methods_in_type"
@@ -172,8 +184,8 @@ The server uses the **Streamable HTTP** MCP transport. Add the following snippet
 {
   "mcpServers": {
     "dnspy": {
-      "type": "streamable-http",
-      "url": "http://localhost:3100",
+      "type": "sse",
+      "url": "http://localhost:3100/sse",
       "timeout": 30
     }
   }
@@ -185,9 +197,11 @@ The server uses the **Streamable HTTP** MCP transport. Add the following snippet
 ```yaml
 mcpServers:
   dnspy:
-    type: streamable-http
-    url: http://localhost:3100
+    type: sse
+    url: http://localhost:3100/sse
 ```
+
+> **SSE endpoints**: `GET /sse` (or `/events`, `/`) opens the event stream. The server immediately sends `event: endpoint\ndata: http://localhost:3100/message?sessionId=<id>`. The client then POSTs JSON-RPC requests to that URL and receives responses as `event: message` SSE events. `POST /` still accepts direct JSON-RPC for curl/scripting use.
 
 ---
 
@@ -209,6 +223,9 @@ Tools for listing and inspecting .NET assemblies loaded in dnSpy.
 | `list_types` | List types in an assembly, with class/interface/enum flags. Supports glob and regex via `name_pattern` | `assembly_name` | `namespace`, `name_pattern`, `cursor` |
 | `list_native_modules` | List native DLLs imported via `[DllImport]`, grouped by DLL name with the managed methods that use them | `assembly_name` | — |
 | `load_assembly` | Load a .NET assembly into dnSpy from a file on disk **or** from a running process by PID. Supports both normal PE layout and raw memory-layout dumps | — | `file_path`, `memory_layout`, `pid`, `module_name` |
+| `select_assembly` | Select an assembly in the dnSpy document tree and open it in the active tab; changes the current assembly context for subsequent operations | `assembly_name` | `file_path` |
+| `close_assembly` | Close (remove) a specific assembly from dnSpy | `assembly_name` | `file_path` |
+| `close_all_assemblies` | Close all assemblies currently loaded in dnSpy, clearing the document tree | — | — |
 
 #### Parameter details
 
@@ -222,6 +239,7 @@ Tools for listing and inspecting .NET assemblies loaded in dnSpy.
 | `memory_layout` | boolean | (`load_assembly`) When `true`, treat the file as raw memory-layout (VAs, not file offsets). Default `false` |
 | `pid` | integer | (`load_assembly`) PID of a running .NET process to dump from. Requires active debug session. |
 | `module_name` | string | (`load_assembly`) Module name/filename to pick when using `pid`. Defaults to first EXE module. |
+| `file_path` | string | (`select_assembly`, `close_assembly`) Absolute path (FilePath from `list_assemblies`) to disambiguate when multiple assemblies share the same short name |
 
 ---
 
@@ -288,6 +306,16 @@ Low-level IL inspection for a method body.
 | `get_method_il` | IL instruction listing with offsets, opcodes, operands, and local variable table | `assembly_name`, `type_full_name`, `method_name` | — |
 | `get_method_il_bytes` | Raw IL bytes as a hex string and Base64 | `assembly_name`, `type_full_name`, `method_name` | — |
 | `get_method_exception_handlers` | try/catch/finally/fault region table (offsets and handler type) | `assembly_name`, `type_full_name`, `method_name` | — |
+| `dump_cordbg_il` | For each MethodDef in the paused module, reads `ICorDebugFunction.ILCode.Address` and `ILCode.Size` via the CorDebug COM API (through reflection). Reports whether IL addresses fall inside the PE image (encrypted stubs) or outside (JIT hook buffers). Useful for ConfuserEx JIT-hook analysis. Requires an active paused debug session | — | `module_name`, `output_path`, `max_methods`, `include_bytes` |
+
+#### Parameter details (`dump_cordbg_il`)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `module_name` | string | Module name or filename filter (default: first EXE module) |
+| `output_path` | string | Optional path to save full JSON results to disk |
+| `max_methods` | integer | Max number of MethodDef tokens to scan (default `10000`) |
+| `include_bytes` | boolean | When `true`, include Base64-encoded IL bytes for each method (default `false`) |
 
 ---
 
@@ -329,6 +357,7 @@ In-memory metadata editing. Changes are applied immediately to dnlib's in-memory
 | `set_assembly_flags` | Set or clear an individual assembly attribute flag (e.g. `PublicKey`, `Retargetable`, processor architecture) | `assembly_name`, `flag_name`, `value` | — |
 | `list_assembly_references` | List all assembly references (AssemblyRef table entries) in the manifest module | `assembly_name` | — |
 | `add_assembly_reference` | Add an assembly reference by loading a DLL from disk. Creates a TypeForwarder to anchor the reference | `assembly_name`, `dll_path` | — |
+| `remove_assembly_reference` | Remove an AssemblyRef entry and all TypeForwarder entries that target it. Returns a warning if TypeRefs in code still use the reference | `assembly_name`, `reference_name` | — |
 | `inject_type_from_dll` | Deep-clone a type (fields, methods with IL, properties, events) from an external DLL into the target assembly | `assembly_name`, `dll_path`, `type_full_name` | — |
 | `list_pinvoke_methods` | List all P/Invoke (`DllImport`) declarations in a type: managed name, token, DLL name, native function name | `assembly_name`, `type_full_name` | — |
 | `patch_method_to_ret` | Replace a method's IL body with a minimal return stub (`nop` + `ret`) to neutralize it. Works on P/Invoke methods too (converts to managed stub) | `assembly_name`, `type_full_name`, `method_name` | — |
@@ -349,6 +378,33 @@ In-memory metadata editing. Changes are applied immediately to dnlib's in-memory
 > **Note**: `rename_member` changes only the metadata name. It does **not** update call sites, string literals, or XML docs.
 
 > **Note**: `patch_method_to_ret` is ideal for disabling anti-debug, anti-tamper, or license-check routines before saving and re-analyzing.
+
+---
+
+### Embedded Resource Tools
+
+Read, write, and extract entries from the ManifestResource table. All write operations are in-memory until `save_assembly` is called.
+
+| Tool | Description | Required params | Optional params |
+|------|-------------|-----------------|-----------------|
+| `list_resources` | List all ManifestResource entries: name, kind (Embedded/Linked/AssemblyLinked), size, visibility, and whether it looks like a Costura.Fody-embedded assembly | `assembly_name` | — |
+| `get_resource` | Extract an embedded resource as Base64 (up to 4 MB inline) and/or save to disk | `assembly_name`, `resource_name` | `output_path`, `skip_base64` |
+| `add_resource` | Embed a file from disk as a new EmbeddedResource in the assembly | `assembly_name`, `resource_name`, `file_path` | `is_public` |
+| `remove_resource` | Delete a ManifestResource entry by name | `assembly_name`, `resource_name` | — |
+| `extract_costura` | Detect and extract Costura.Fody-embedded assemblies (`costura.*.dll.compressed` resources). Decompresses gzip automatically. Useful for analysing assemblies packed with Costura | `assembly_name`, `output_directory` | `decompress` |
+
+#### Parameter details
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `resource_name` | string | Exact resource name (use `list_resources` to find it) |
+| `output_path` | string | (`get_resource`) Absolute path to write raw resource bytes |
+| `skip_base64` | boolean | (`get_resource`) Omit Base64 from response; useful when saving large resources to disk (default `false`) |
+| `is_public` | boolean | (`add_resource`) Resource visibility — `true` = Public (default), `false` = Private |
+| `output_directory` | string | (`extract_costura`) Directory where extracted DLLs/PDBs will be written |
+| `decompress` | boolean | (`extract_costura`) Decompress gzip-compressed resources (default `true`) |
+
+> **Costura.Fody workflow**: `list_resources` (confirm `costura.*` entries exist) → `extract_costura output_directory=C:\extracted` → `load_assembly` each extracted DLL → analyse normally with MCP tools.
 
 ---
 
@@ -442,16 +498,15 @@ Tools that operate on raw PE file bytes — no debug session required.
 
 ### Deobfuscation Tools
 
-Integrated [de4dot](https://github.com/de4dot/de4dot) engine for symbol renaming and control-flow deobfuscation.
-
-> **Requires**: .NET Framework 4.8 runtime (net48 dnSpy build). Not available on the net10.0-windows build.
+Two de4dot integration modes: **in-process** (`deobfuscate_assembly` — uses bundled de4dot libraries, available in all builds) and **external process** (`run_de4dot` — spawns `de4dot.exe`, supports dynamic string decryption, available in all builds).
 
 | Tool | Description | Required params | Optional params |
 |------|-------------|-----------------|-----------------|
-| `list_deobfuscators` | List all obfuscator types supported by the de4dot engine (e.g. ConfuserEx, Dotfuscator, SmartAssembly, etc.) | — | — |
-| `detect_obfuscator` | Detect which obfuscator was applied to a .NET assembly file on disk using de4dot's heuristic detection engine | `file_path` | — |
-| `deobfuscate_assembly` | Deobfuscate a .NET assembly: renames mangled symbols, deobfuscates control flow, decrypts strings. Output is saved to disk | `file_path`, `output_path` | `obfuscator_type`, `rename_symbols` |
+| `list_deobfuscators` | List all obfuscator types supported by the in-process de4dot engine | — | — |
+| `detect_obfuscator` | Detect which obfuscator was applied to a .NET assembly file on disk using de4dot's heuristic detection | `file_path` | — |
+| `deobfuscate_assembly` | Deobfuscate a .NET assembly in-process: renames mangled symbols, deobfuscates control flow, decrypts strings | `file_path`, `output_path` | `obfuscator_type`, `rename_symbols` |
 | `save_deobfuscated` | Return a previously deobfuscated file as a Base64-encoded blob. Useful when the output file cannot be accessed directly | `file_path` | — |
+| `run_de4dot` | Run `de4dot.exe` as an external process. Supports dynamic string decryption and ConfuserEx method decryption that require a separate process | `file_path` | `output_path`, `obfuscator_type`, `dont_rename`, `no_cflow_deob`, `string_decrypter`, `extra_args`, `de4dot_path`, `timeout_ms` |
 
 #### Parameter details
 
@@ -459,8 +514,14 @@ Integrated [de4dot](https://github.com/de4dot/de4dot) engine for symbol renaming
 |-----------|------|-------------|
 | `file_path` | string | Absolute path to the .NET assembly on disk |
 | `output_path` | string | Absolute path for the cleaned output assembly |
-| `obfuscator_type` | string | Force a specific obfuscator (e.g. `cx` for ConfuserEx). Omit to let de4dot auto-detect. |
-| `rename_symbols` | boolean | Whether to rename obfuscated symbols (default `true`) |
+| `obfuscator_type` | string | Force a specific obfuscator type code (`cr` for ConfuserEx, `un` for unknown/auto, etc.). Omit to let de4dot auto-detect. |
+| `rename_symbols` | boolean | (`deobfuscate_assembly`) Whether to rename obfuscated symbols (default `true`) |
+| `dont_rename` | boolean | (`run_de4dot`) Skip symbol renaming if `true` (default `false`) |
+| `no_cflow_deob` | boolean | (`run_de4dot`) Skip control-flow deobfuscation if `true` (default `false`) |
+| `string_decrypter` | string | (`run_de4dot`) String decrypter mode: `none`, `default`, `static`, `delegate`, `emulate` |
+| `extra_args` | string | (`run_de4dot`) Additional de4dot command-line arguments passed verbatim |
+| `de4dot_path` | string | (`run_de4dot`) Override path to `de4dot.exe`. Defaults to well-known search paths. |
+| `timeout_ms` | integer | (`run_de4dot`) Max milliseconds to wait for de4dot to finish (default `120000`) |
 
 ---
 
@@ -469,6 +530,8 @@ Integrated [de4dot](https://github.com/de4dot/de4dot) engine for symbol renaming
 | Tool | Description | Required params |
 |------|-------------|-----------------|
 | `list_tools` | Return the full schema for every registered tool as JSON | — |
+| `get_mcp_config` | Return the current MCP server configuration and the path to `mcp-config.json` | — |
+| `reload_mcp_config` | Reload `mcp-config.json` from disk without restarting dnSpy | — |
 
 ---
 
@@ -654,7 +717,7 @@ To fetch the next page, pass the `nextCursor` value as the `cursor` argument in 
 | `src/Application/MemoryInspectTools.cs` | Local variable inspection from paused debug frame |
 | `src/Application/UsageFindingCommandTools.cs` | Cross-assembly IL usage analysis (callers, field reads/writes) |
 | `src/Application/CodeAnalysisHelpers.cs` | Static call-graph, dependency chain, dead code analysis |
-| `src/Application/De4dotTools.cs` | de4dot integration for deobfuscation (net48 only) |
+| `src/Application/De4dotTools.cs` | de4dot in-process integration; available in all builds |
 | `src/Presentation/TheExtension.cs` | MEF entry point, server lifecycle |
 | `src/Contracts/McpProtocol.cs` | MCP DTOs (ToolInfo, CallToolResult, …) |
 
@@ -735,8 +798,9 @@ netstat -ano | findstr :3100
 | `No paused process found` | Process is still running | Call `break_debugger` first |
 | `dump_module_from_memory` returns no bytes | Module has no address (pure dynamic) | Some in-memory modules emitted by reflection emit cannot be dumped |
 | Dump `IsFileLayout: false` | Memory layout dump | Use `dump_module_unpacked` instead — it performs the layout fix automatically |
-| Deobfuscation tools not found | Running net10.0-windows build | de4dot tools only available in the net48 build; start the 32-bit dnSpy (`dnSpy.exe` not `dnSpy-x64.exe`) |
 | `unpack_from_memory` fails with anti-debug error | Process kills itself before EntryPoint | Use `patch_method_to_ret` to neutralize anti-debug methods first, save the patched binary, then retry |
+| `Failed to reconnect` when adding MCP server | Wrong transport type | Use `--transport sse` with Claude Code CLI, not `streamable-http`. URL must point to `/sse` endpoint: `http://localhost:3100/sse` |
+| `dump_cordbg_il` returns E_NOINTERFACE errors | COM STA apartment threading | `ICorDebugModule` COM objects belong to the CorDebug engine thread; calling from another STA fails. This is a known limitation — use `dump_module_unpacked` instead for memory dumps. |
 
 ---
 

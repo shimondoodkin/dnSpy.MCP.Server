@@ -22,10 +22,12 @@ using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using dnSpy.Contracts.Debugger;
+using dnSpy.Contracts.Debugger.DotNet;
 using dnSpy.Contracts.Debugger.DotNet.CorDebug;
 using dnSpy.Contracts.Debugger.DotNet.Evaluation;
 using dnSpy.MCP.Server.Contracts;
@@ -942,5 +944,277 @@ namespace dnSpy.MCP.Server.Application {
 			if ((ch & 0x80000000u) != 0) parts.Add("WRITE");
 			return parts.Count > 0 ? string.Join("|", parts) : $"0x{ch:X8}";
 		}
+
+	// ── dump_cordbg_il ────────────────────────────────────────────────────────
+
+	/// <summary>
+	/// For each MethodDef token in the paused module, reads ICorDebugFunction.ILCode.Address
+	/// and ILCode.Size via reflection through the private DbgEngineImpl.DbgModuleData.DnModule
+	/// chain.  Reports whether the IL address falls inside the PE image (likely the encrypted
+	/// stub still on-disk) or outside it (potentially the hook-provided decrypted buffer that
+	/// is still in CLR-internal memory).
+	/// Arguments: module_name (optional), output_path (optional JSON file), max_methods (int,
+	///            default 10000), include_bytes (bool, default false — set true to get base64 IL)
+	/// </summary>
+	public CallToolResult DumpCordbgIL(Dictionary<string, object>? arguments) {
+		string? moduleFilter = null;
+		if (arguments != null && arguments.TryGetValue("module_name", out var mnObj))
+			moduleFilter = mnObj?.ToString();
+
+		string? outputPath = null;
+		if (arguments != null && arguments.TryGetValue("output_path", out var opObj))
+			outputPath = opObj?.ToString();
+
+		int maxMethods = 10000;
+		if (arguments != null && arguments.TryGetValue("max_methods", out var mmObj) &&
+			mmObj is JsonElement mmElem && mmElem.TryGetInt32(out var mmInt))
+			maxMethods = Math.Max(1, mmInt);
+
+		bool includeBytes = false;
+		if (arguments != null && arguments.TryGetValue("include_bytes", out var ibObj)) {
+			if (ibObj is bool ibBool) includeBytes = ibBool;
+			else if (ibObj is JsonElement ibElem) includeBytes = ibElem.ValueKind == JsonValueKind.True;
+		}
+
+		var mgr = dbgManager.Value;
+		if (!mgr.IsDebugging)
+			throw new InvalidOperationException("Debugger is not active. Start a debug session first.");
+
+		return System.Windows.Application.Current.Dispatcher.Invoke(() => {
+			var process = mgr.Processes.FirstOrDefault(p => p.State == DbgProcessState.Paused)
+				?? mgr.Processes.FirstOrDefault()
+				?? throw new InvalidOperationException("No debugged process found.");
+
+			// Locate target module
+			DbgModule? targetModule = null;
+			if (!string.IsNullOrEmpty(moduleFilter)) {
+				var (m, _) = FindModule(mgr, moduleFilter!, null);
+				targetModule = m;
+			}
+			if (targetModule == null) {
+				// Fallback: first non-dynamic exe module
+				targetModule = process.Runtimes
+					.SelectMany(r => r.Modules)
+					.FirstOrDefault(m => m.IsExe && !m.IsDynamic)
+					?? process.Runtimes.SelectMany(r => r.Modules).FirstOrDefault(m => !m.IsDynamic);
+			}
+			if (targetModule == null)
+				throw new InvalidOperationException("No suitable module found. Use module_name to specify.");
+
+			ulong moduleBase = targetModule.HasAddress ? targetModule.Address : 0;
+			ulong moduleSize = targetModule.HasAddress ? targetModule.Size : 0;
+
+			// Get DmdModule for type/method enumeration
+			var dmdModule = targetModule.GetReflectionModule();
+			if (dmdModule == null)
+				throw new InvalidOperationException($"Module '{targetModule.Name}' is not a .NET module (no ReflectionModule).");
+
+			// Obtain CorModule via reflection (private DbgEngineImpl+DbgModuleData.DnModule.CorModule)
+			object? corModule = null;
+			string? corModuleError = null;
+			try { corModule = GetCorModuleViaReflection(targetModule); }
+			catch (Exception ex) { corModuleError = ex.Message; }
+
+			var methodEntries = new List<object>();
+			int totalMethods = 0, inPeCount = 0, outOfPeCount = 0, errorCount = 0, skippedCount = 0;
+
+			foreach (var type in dmdModule.GetTypes()) {
+				if (totalMethods >= maxMethods) break;
+				foreach (var method in type.DeclaredMethods) {
+					if (totalMethods >= maxMethods) { skippedCount++; continue; }
+
+					uint token = (uint)method.MetadataToken;
+					if ((token >> 24) != 0x06) continue; // only MethodDef
+					totalMethods++;
+
+					if (corModule == null) { errorCount++; continue; }
+
+					try {
+						var ilInfo = GetILCodeInfoViaReflection(corModule, token);
+						if (ilInfo == null) { errorCount++; continue; }
+
+						var (ilAddr, ilSize) = ilInfo.Value;
+						if (ilAddr == 0) { errorCount++; continue; }
+
+						bool isInPE = moduleBase != 0 && ilAddr >= moduleBase && ilAddr < moduleBase + moduleSize;
+						if (isInPE) inPeCount++; else outOfPeCount++;
+
+						// Peek at first bytes to check if IL looks valid or encrypted
+						int peekSize = (int)Math.Min(ilSize, 32u);
+						byte[]? peekBytes = null;
+						if (peekSize > 0) {
+							try { peekBytes = process.ReadMemory(ilAddr, peekSize); }
+							catch { /* ignore read failures */ }
+						}
+
+						// Optionally read the full method body (header included, from addr-12)
+						string? fullBytesB64 = null;
+						if (includeBytes && ilSize > 0 && ilSize < 512 * 1024u) {
+							try {
+								ulong startAddr = ilAddr >= 12 ? ilAddr - 12 : ilAddr;
+								int fullLen = (int)Math.Min(ilSize + 12u, 524300u);
+								var fullBytes = process.ReadMemory(startAddr, fullLen);
+								fullBytesB64 = Convert.ToBase64String(fullBytes);
+							}
+							catch { /* ignore */ }
+						}
+
+						methodEntries.Add(new {
+							Token       = $"0x{token:X8}",
+							Type        = type.Name,
+							Method      = method.Name,
+							ILAddress   = $"0x{ilAddr:X16}",
+							ILSize      = ilSize,
+							IsInPEImage = isInPE,
+							PeekHex     = peekBytes != null
+								? BitConverter.ToString(peekBytes).Replace("-", " ")
+								: null,
+							FullBytesBase64 = fullBytesB64
+						});
+					}
+					catch (Exception ex) {
+						errorCount++;
+						var actualEx = ex is TargetInvocationException tie ? tie.InnerException ?? tie : ex;
+						methodEntries.Add(new {
+							Token  = $"0x{token:X8}",
+							Type   = type.Name,
+							Method = method.Name,
+							Error  = $"{actualEx.GetType().Name}: {actualEx.Message}"
+						});
+					}
+				}
+			}
+
+			var summaryObj = new {
+				Module              = targetModule.Name,
+				ModuleBase          = moduleBase != 0 ? $"0x{moduleBase:X16}" : "N/A",
+				ModuleSizeBytes     = moduleSize,
+				TotalMethodsScanned = totalMethods,
+				InPEImage           = inPeCount,
+				OutsidePEImage      = outOfPeCount,
+				Errors              = errorCount,
+				Skipped             = skippedCount,
+				CorModuleAccessError = corModuleError,
+				Note = outOfPeCount > 0
+					? $"{outOfPeCount} method(s) have IL addresses outside the PE image — these may be hook-decrypted buffers still in CLR-internal memory."
+					: "All scanned methods have IL inside the PE image (address points to mapped module, possibly encrypted stubs).",
+				Methods = methodEntries
+			};
+
+			var json = JsonSerializer.Serialize(summaryObj, new JsonSerializerOptions {
+				WriteIndented = true,
+				DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+			});
+
+			if (!string.IsNullOrWhiteSpace(outputPath)) {
+				var dir = Path.GetDirectoryName(outputPath);
+				if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+				File.WriteAllText(outputPath, json);
+			}
+
+			// Truncate inline response to stay manageable
+			const int inlineLimit = 50;
+			if (methodEntries.Count > inlineLimit) {
+				var trimmedObj = new {
+					summaryObj.Module, summaryObj.ModuleBase, summaryObj.ModuleSizeBytes,
+					summaryObj.TotalMethodsScanned, summaryObj.InPEImage, summaryObj.OutsidePEImage,
+					summaryObj.Errors, summaryObj.Skipped, summaryObj.CorModuleAccessError,
+					summaryObj.Note,
+					OutputPath = outputPath,
+					MethodsSample    = methodEntries.Take(inlineLimit).ToList(),
+					TruncatedAt      = inlineLimit,
+					HintSeeFile      = !string.IsNullOrWhiteSpace(outputPath)
+						? $"Full results saved to {outputPath}"
+						: "Pass output_path to save full results to disk."
+				};
+				json = JsonSerializer.Serialize(trimmedObj, new JsonSerializerOptions {
+					WriteIndented = true,
+					DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+				});
+			}
+
+			return new CallToolResult {
+				Content = new List<ToolContent> { new ToolContent { Text = json } }
+			};
+		});
+	}
+
+	/// <summary>Navigate DbgModule → private DbgEngineImpl+DbgModuleData → DnModule → CorModule
+	/// using reflection, since DbgModuleData is a private nested class.</summary>
+	static object GetCorModuleViaReflection(DbgModule dbgModule) {
+		// 1. Find DbgModuleData type (private nested class of DbgEngineImpl)
+		Type? moduleDataType = null;
+		foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) {
+			moduleDataType = asm.GetType(
+				"dnSpy.Debugger.DotNet.CorDebug.Impl.DbgEngineImpl+DbgModuleData",
+				throwOnError: false, ignoreCase: false);
+			if (moduleDataType != null) break;
+		}
+		if (moduleDataType == null)
+			throw new InvalidOperationException(
+				"Type DbgEngineImpl+DbgModuleData not found — is the CorDebug debugger extension loaded?");
+
+		// 2. Find TryGetData<T>(out T?) traversing the type hierarchy
+		MethodInfo? tryGetDataDef = null;
+		for (var t = dbgModule.GetType(); t != null && tryGetDataDef == null; t = t.BaseType) {
+			foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)) {
+				if (m.Name == "TryGetData" && m.IsGenericMethodDefinition &&
+					m.GetGenericArguments().Length == 1 && m.GetParameters().Length == 1) {
+					tryGetDataDef = m;
+					break;
+				}
+			}
+		}
+		if (tryGetDataDef == null)
+			throw new InvalidOperationException("TryGetData<T> method not found on DbgModule hierarchy.");
+
+		// 3. Invoke TryGetData<DbgModuleData>(out DbgModuleData? data)
+		var genericMethod = tryGetDataDef.MakeGenericMethod(moduleDataType);
+		var invokeArgs   = new object?[] { null };
+		var found        = (bool)(genericMethod.Invoke(dbgModule, invokeArgs) ?? false);
+		if (!found || invokeArgs[0] == null)
+			throw new InvalidOperationException(
+				"TryGetData<DbgModuleData> returned false — module may not be a CorDebug-managed module.");
+
+		var moduleData = invokeArgs[0]!;
+
+		// 4. Get DnModule property from DbgModuleData
+		var dnModuleProp = moduleDataType.GetProperty("DnModule", BindingFlags.Public | BindingFlags.Instance);
+		var dnModule     = dnModuleProp?.GetValue(moduleData)
+			?? throw new InvalidOperationException("DbgModuleData.DnModule is null.");
+
+		// 5. Get CorModule property from DnModule
+		var corModuleProp = dnModule.GetType().GetProperty("CorModule", BindingFlags.Public | BindingFlags.Instance);
+		return corModuleProp?.GetValue(dnModule)
+			?? throw new InvalidOperationException("DnModule.CorModule is null.");
+	}
+
+	/// <summary>Call CorModule.GetFunctionFromToken(token).ILCode and return (Address, Size).
+	/// Unwraps TargetInvocationException so callers see the real error.</summary>
+	static (ulong address, uint size)? GetILCodeInfoViaReflection(object corModule, uint mdToken) {
+		var getFuncMethod = corModule.GetType().GetMethod("GetFunctionFromToken",
+			BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(uint) }, null);
+		if (getFuncMethod == null) throw new InvalidOperationException("GetFunctionFromToken method not found on CorModule type.");
+
+		object? corFunc;
+		try { corFunc = getFuncMethod.Invoke(corModule, new object[] { mdToken }); }
+		catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+
+		if (corFunc == null) return null; // method not found in this module (abstract, extern, etc.)
+
+		var ilCodeProp = corFunc.GetType().GetProperty("ILCode", BindingFlags.Public | BindingFlags.Instance);
+		object? ilCode;
+		try { ilCode = ilCodeProp?.GetValue(corFunc); }
+		catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+		if (ilCode == null) return null;
+
+		var addrProp = ilCode.GetType().GetProperty("Address", BindingFlags.Public | BindingFlags.Instance);
+		var sizeProp = ilCode.GetType().GetProperty("Size",    BindingFlags.Public | BindingFlags.Instance);
+		if (addrProp == null || sizeProp == null) return null;
+
+		ulong addr = (ulong)(addrProp.GetValue(ilCode) ?? 0UL);
+		uint  size = (uint) (sizeProp.GetValue(ilCode) ?? 0U);
+		return (addr, size);
+	}
 	}
 }

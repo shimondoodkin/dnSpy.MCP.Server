@@ -153,7 +153,11 @@ namespace dnSpy.MCP.Server.Application {
 			if (!arguments.TryGetValue("method_name", out var methodNameObj))
 				throw new ArgumentException("method_name is required");
 
-			var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+			string? filePath = null;
+			if (arguments.TryGetValue("file_path", out var fpObj))
+				filePath = fpObj?.ToString();
+
+			var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "", filePath);
 			if (assembly == null)
 				throw new ArgumentException($"Assembly not found: {asmNameObj}");
 
@@ -492,14 +496,30 @@ namespace dnSpy.MCP.Server.Application {
 
 		// ── Helpers ─────────────────────────────────────────────────────────────
 
-		AssemblyDef? FindAssemblyByName(string name) =>
-			documentTreeView.GetAllModuleNodes()
+		AssemblyDef? FindAssemblyByName(string name, string? filePath = null) {
+			if (!string.IsNullOrEmpty(filePath)) {
+				var normalized = filePath!.Replace('/', '\\');
+				var byPath = documentTreeView.GetAllModuleNodes()
+					.FirstOrDefault(m => (m.Document?.Filename ?? "").Replace('/', '\\')
+						.Equals(normalized, StringComparison.OrdinalIgnoreCase));
+				if (byPath?.Document?.AssemblyDef != null) return byPath.Document.AssemblyDef;
+			}
+			return documentTreeView.GetAllModuleNodes()
 				.Select(m => m.Document?.AssemblyDef)
 				.FirstOrDefault(a => a != null && a.Name.String.Equals(name, StringComparison.OrdinalIgnoreCase));
+		}
 
 		TypeDef? FindTypeInAssembly(AssemblyDef assembly, string fullName) =>
 			assembly.Modules
-				.SelectMany(m => m.Types)
+				.SelectMany(m => GetAllTypesRecursive(m.Types))
 				.FirstOrDefault(t => t.FullName.Equals(fullName, StringComparison.Ordinal));
+
+		static System.Collections.Generic.IEnumerable<TypeDef> GetAllTypesRecursive(System.Collections.Generic.IEnumerable<TypeDef> types) {
+			foreach (var t in types) {
+				yield return t;
+				foreach (var n in GetAllTypesRecursive(t.NestedTypes))
+					yield return n;
+			}
+		}
 	}
 }

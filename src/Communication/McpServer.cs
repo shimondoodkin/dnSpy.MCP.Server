@@ -25,6 +25,7 @@ namespace dnSpy.MCP.Server.Communication {
 		readonly BepInExResources bepinexResources;
 		HttpListener? httpListener;
 		readonly List<SseClient> sseClients = new List<SseClient>();
+		readonly Dictionary<string, SseClient> sessionClients = new Dictionary<string, SseClient>();
 		readonly object sseClientsLock = new object();
 		CancellationTokenSource? cts;
 
@@ -32,6 +33,9 @@ namespace dnSpy.MCP.Server.Communication {
 		static readonly JsonSerializerOptions jsonOptions = new JsonSerializerOptions {
 			DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
 		};
+
+		// UTF-8 without BOM — SSE clients break on the BOM that Encoding.UTF8 emits
+		static readonly UTF8Encoding utf8NoBom = new UTF8Encoding(false);
 
 		/// <summary>
 		/// Initializes the MCP server with the specified settings, tools, and documentation.
@@ -172,10 +176,16 @@ namespace dnSpy.MCP.Server.Communication {
 
 				var path = context.Request.Url?.AbsolutePath ?? "/";
 
-				// Handle SSE requests on both /events and / (GET)
-				if (context.Request.HttpMethod == "GET" && (path == "/events" || path == "/")) {
+						// SSE stream: GET /sse, /events, or /
+				if (context.Request.HttpMethod == "GET" && (path == "/sse" || path == "/events" || path == "/")) {
 					McpLogger.Debug($"SSE connection attempt on path: {path}");
 					HandleSseRequest(context);
+					return;
+				}
+
+				// MCP SSE message endpoint: POST /message or /messages with ?sessionId=
+				if (context.Request.HttpMethod == "POST" && (path == "/message" || path == "/messages")) {
+					HandleSseMessageRequest(context);
 					return;
 				}
 
@@ -330,14 +340,19 @@ namespace dnSpy.MCP.Server.Communication {
 				response.Headers["Cache-Control"] = "no-cache";
 				response.Headers["Connection"] = "keep-alive";
 
-				McpLogger.Debug("SSE headers sent to client");
-				var writer = new StreamWriter(response.OutputStream, Encoding.UTF8) { AutoFlush = true };
-				writer.WriteLine(": connected");
+					McpLogger.Debug("SSE headers sent to client");
+				var sessionId = Guid.NewGuid().ToString("N");
+				var host = context.Request.Url?.Host ?? "localhost";
+				var port = context.Request.Url?.Port ?? settings.Port;
+				var endpointUrl = $"http://{host}:{port}/message?sessionId={sessionId}";
+				var writer = new StreamWriter(response.OutputStream, utf8NoBom) { AutoFlush = true };
+				writer.WriteLine("event: endpoint");
+				writer.WriteLine($"data: {endpointUrl}");
 				writer.WriteLine();
 				writer.Flush();
 
-				McpLogger.Info("SSE client connected and registered");
-				var client = new SseClient(writer, response);
+				McpLogger.Info($"SSE client connected, sessionId={sessionId}, endpoint={endpointUrl}");
+				var client = new SseClient(writer, response, sessionId);
 				AddSseClient(client);
 				BroadcastStatus("running"); // push latest state immediately
 
@@ -354,7 +369,54 @@ namespace dnSpy.MCP.Server.Communication {
 			}
 		}
 
-		async Task RunSseHeartbeatAsync(SseClient client, CancellationToken token) {
+		void HandleSseMessageRequest(HttpListenerContext context) {
+		var sessionId = context.Request.QueryString["sessionId"];
+		if (string.IsNullOrEmpty(sessionId)) {
+			context.Response.StatusCode = 400;
+			context.Response.Close();
+			return;
+		}
+
+		SseClient? client;
+		lock (sseClientsLock) {
+			sessionClients.TryGetValue(sessionId, out client);
+		}
+
+		if (client == null || client.IsClosed) {
+			McpLogger.Warning($"POST /message: unknown or closed sessionId={sessionId}");
+			context.Response.StatusCode = 404;
+			context.Response.Close();
+			return;
+		}
+
+		string body;
+		using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
+			body = reader.ReadToEnd();
+
+		// Respond 202 Accepted immediately; actual response goes via SSE stream
+		context.Response.StatusCode = 202;
+		context.Response.ContentLength64 = 0;
+		context.Response.Close();
+
+		var capturedClient = client;
+		Task.Run(() => {
+			try {
+				var request = JsonSerializer.Deserialize<McpRequest>(body);
+				if (request == null) {
+					McpLogger.Warning("POST /message: invalid JSON-RPC body");
+					return;
+				}
+				var response = HandleRequest(request);
+				var json = JsonSerializer.Serialize(response, jsonOptions);
+				capturedClient.SendMessage(json);
+			}
+			catch (Exception ex) {
+				McpLogger.Exception(ex, "Error processing SSE message");
+			}
+		});
+	}
+
+	async Task RunSseHeartbeatAsync(SseClient client, CancellationToken token) {
 			try {
 				while (!token.IsCancellationRequested && !client.IsClosed) {
 					await Task.Delay(TimeSpan.FromSeconds(15), token);
@@ -395,12 +457,16 @@ namespace dnSpy.MCP.Server.Communication {
 		void AddSseClient(SseClient client) {
 			lock (sseClientsLock) {
 				sseClients.Add(client);
+				if (!string.IsNullOrEmpty(client.SessionId))
+					sessionClients[client.SessionId] = client;
 			}
 		}
 
 		void RemoveSseClient(SseClient client) {
 			lock (sseClientsLock) {
 				if (sseClients.Remove(client)) {
+					if (!string.IsNullOrEmpty(client.SessionId))
+						sessionClients.Remove(client.SessionId);
 					client.Dispose();
 				}
 			}
@@ -411,6 +477,7 @@ namespace dnSpy.MCP.Server.Communication {
 				foreach (var client in sseClients)
 					client.Dispose();
 				sseClients.Clear();
+				sessionClients.Clear();
 			}
 		}
 
@@ -420,6 +487,8 @@ namespace dnSpy.MCP.Server.Communication {
 			readonly object writeLock = new object();
 			bool isClosed;
 
+			public string SessionId { get; }
+
 			public bool IsClosed {
 				get {
 					lock (writeLock) {
@@ -428,9 +497,21 @@ namespace dnSpy.MCP.Server.Communication {
 				}
 			}
 
-			public SseClient(StreamWriter writer, HttpListenerResponse response) {
+			public SseClient(StreamWriter writer, HttpListenerResponse response, string sessionId) {
 				this.writer = writer;
 				this.response = response;
+				SessionId = sessionId;
+			}
+
+			public void SendMessage(string json) {
+				lock (writeLock) {
+					if (isClosed)
+						return;
+					writer.WriteLine("event: message");
+					writer.WriteLine($"data: {json}");
+					writer.WriteLine();
+					writer.Flush();
+				}
 			}
 
 			public void WriteEvent(string eventName, string data) {

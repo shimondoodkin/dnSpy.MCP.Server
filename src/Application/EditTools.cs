@@ -20,6 +20,8 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
 using dnlib.DotNet;
@@ -59,11 +61,15 @@ namespace dnSpy.MCP.Server.Application {
 			if (!arguments.TryGetValue("type_full_name", out var typeNameObj))
 				throw new ArgumentException("type_full_name is required");
 
-			var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+			string? filePath = null;
+			arguments.TryGetValue("file_path", out var fpObj);
+			filePath = fpObj?.ToString();
+
+			var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "", filePath);
 			if (assembly == null)
 				throw new ArgumentException($"Assembly not found: {asmNameObj}");
 
-			var type = FindTypeInAssembly(assembly, typeNameObj.ToString() ?? "");
+			var type = FindTypeInAssemblyAll(assembly, typeNameObj.ToString() ?? "");
 			if (type == null)
 				throw new ArgumentException($"Type not found: {typeNameObj}");
 
@@ -824,6 +830,355 @@ namespace dnSpy.MCP.Server.Application {
 		};
 	}
 
+	// ── Embedded Resources ────────────────────────────────────────────────────
+
+	static bool GetBoolArg(Dictionary<string, object> arguments, string key, bool defaultVal) {
+		if (!arguments.TryGetValue(key, out var v)) return defaultVal;
+		if (v is bool b) return b;
+		if (v is System.Text.Json.JsonElement je)
+			return je.ValueKind == System.Text.Json.JsonValueKind.True;
+		return defaultVal;
+	}
+
+	/// <summary>
+	/// Lists all ManifestResource entries in an assembly's manifest.
+	/// Arguments: assembly_name
+	/// </summary>
+	public CallToolResult ListResources(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var resources = module.Resources.Select((r, i) => {
+			long? size = null;
+			if (r is EmbeddedResource er) {
+				var rdr = er.CreateReader();
+				size = (long)rdr.Length;
+			}
+			return new {
+				Index = i,
+				Name = r.Name.String,
+				Kind = r.ResourceType switch {
+					ResourceType.Embedded       => "Embedded",
+					ResourceType.Linked         => "Linked",
+					ResourceType.AssemblyLinked => "AssemblyLinked",
+					_ => r.ResourceType.ToString()
+				},
+				IsPublic = r.IsPublic,
+				SizeBytes = size,
+				IsCosturaEmbedded = r.Name.String.StartsWith("costura.", StringComparison.OrdinalIgnoreCase)
+			};
+		}).ToList();
+
+		var result = JsonSerializer.Serialize(new {
+			Assembly = assembly.Name.String,
+			ResourceCount = resources.Count,
+			Resources = resources
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Extracts an embedded resource by name, returning its bytes as Base64 and optionally saving to disk.
+	/// Arguments: assembly_name, resource_name, output_path (opt), skip_base64 (opt bool)
+	/// </summary>
+	public CallToolResult GetResource(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("resource_name", out var resNameObj))
+			throw new ArgumentException("resource_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var resName = resNameObj.ToString() ?? "";
+		var resource = module.Resources.FirstOrDefault(r =>
+			string.Equals(r.Name.String, resName, StringComparison.OrdinalIgnoreCase))
+			?? throw new ArgumentException($"Resource not found: '{resName}'. Use list_resources to see available resources.");
+
+		if (resource is not EmbeddedResource er2)
+			throw new ArgumentException($"Resource '{resName}' is {resource.ResourceType} — only EmbeddedResource can be extracted as bytes.");
+
+		var data = er2.CreateReader().ToArray();
+
+		arguments.TryGetValue("output_path", out var outPathObj);
+		var outPath = outPathObj?.ToString();
+		string? savedTo = null;
+		if (!string.IsNullOrEmpty(outPath)) {
+			var dir = Path.GetDirectoryName(outPath);
+			if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+			File.WriteAllBytes(outPath, data);
+			savedTo = outPath;
+		}
+
+		bool skipBase64 = GetBoolArg(arguments, "skip_base64", false);
+		const int maxBase64Bytes = 4 * 1024 * 1024; // 4 MB inline cap
+		string? base64Data = null;
+		bool truncated = false;
+		if (!skipBase64) {
+			if (data.Length <= maxBase64Bytes) {
+				base64Data = Convert.ToBase64String(data);
+			} else {
+				base64Data = Convert.ToBase64String(data, 0, maxBase64Bytes);
+				truncated = true;
+			}
+		}
+
+		var opts = new JsonSerializerOptions {
+			WriteIndented = true,
+			DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+		};
+		var result = JsonSerializer.Serialize(new {
+			Name = resource.Name.String,
+			SizeBytes = data.Length,
+			SavedTo = savedTo,
+			Base64Truncated = truncated ? $"First {maxBase64Bytes} of {data.Length} bytes" : (string?)null,
+			Data = base64Data
+		}, opts);
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Embeds a file from disk as a new EmbeddedResource (ManifestResource).
+	/// Arguments: assembly_name, resource_name, file_path, is_public (opt, default true)
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult AddResource(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("resource_name", out var resNameObj))
+			throw new ArgumentException("resource_name is required");
+		if (!arguments.TryGetValue("file_path", out var filePathObj))
+			throw new ArgumentException("file_path is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var filePath = filePathObj.ToString() ?? "";
+		if (!File.Exists(filePath))
+			throw new ArgumentException($"File not found: {filePath}");
+
+		var resName = resNameObj.ToString() ?? "";
+		var module = assembly.ManifestModule;
+		bool isPublic = GetBoolArg(arguments, "is_public", true);
+		var flags = isPublic ? ManifestResourceAttributes.Public : ManifestResourceAttributes.Private;
+
+		var data = File.ReadAllBytes(filePath);
+		module.Resources.Add(new EmbeddedResource(resName, data, flags));
+
+		var result = JsonSerializer.Serialize(new {
+			Added = resName,
+			SourceFile = filePath,
+			SizeBytes = data.Length,
+			IsPublic = isPublic,
+			Note = "Call save_assembly to write changes to disk."
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Removes a ManifestResource entry by name.
+	/// Arguments: assembly_name, resource_name
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult RemoveResource(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("resource_name", out var resNameObj))
+			throw new ArgumentException("resource_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var resName = resNameObj.ToString() ?? "";
+		var resource = module.Resources.FirstOrDefault(r =>
+			string.Equals(r.Name.String, resName, StringComparison.OrdinalIgnoreCase))
+			?? throw new ArgumentException($"Resource not found: '{resName}'. Use list_resources to see available resources.");
+
+		module.Resources.Remove(resource);
+
+		var result = JsonSerializer.Serialize(new {
+			Removed = resource.Name.String,
+			Kind = resource.ResourceType.ToString(),
+			Note = "Call save_assembly to write changes to disk."
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Removes an AssemblyRef and any ExportedType (TypeForwarder) entries targeting it.
+	/// If TypeRefs in code still use the reference a warning is emitted — the AssemblyRef
+	/// will remain in the saved file until those usages are also removed.
+	/// Arguments: assembly_name, reference_name
+	/// Changes are in-memory until save_assembly is called.
+	/// </summary>
+	public CallToolResult RemoveAssemblyReference(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("reference_name", out var refNameObj))
+			throw new ArgumentException("reference_name is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var module = assembly.ManifestModule;
+		var refName = refNameObj.ToString() ?? "";
+
+		var asmRef = module.GetAssemblyRefs().FirstOrDefault(r =>
+			string.Equals(r.Name.String, refName, StringComparison.OrdinalIgnoreCase))
+			?? throw new ArgumentException($"Assembly reference not found: '{refName}'. Use list_assembly_references to see available references.");
+
+		// Remove ExportedType forwarders targeting this ref
+		var forwardersToRemove = module.ExportedTypes
+			.Where(et => et.Implementation is AssemblyRef ar &&
+			             string.Equals(ar.Name.String, refName, StringComparison.OrdinalIgnoreCase))
+			.ToList();
+		foreach (var et in forwardersToRemove)
+			module.ExportedTypes.Remove(et);
+
+		// Count remaining TypeRef usages (informational)
+		int typeRefUsages = module.GetTypeRefs()
+			.Count(tr => tr.ResolutionScope is AssemblyRef ar &&
+			             string.Equals(ar.Name.String, refName, StringComparison.OrdinalIgnoreCase));
+
+		var opts = new JsonSerializerOptions {
+			WriteIndented = true,
+			DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+		};
+		var result = JsonSerializer.Serialize(new {
+			RemovedReference = asmRef.FullName,
+			TypeForwardersRemoved = forwardersToRemove.Count,
+			RemainingTypeRefUsages = typeRefUsages,
+			Warning = typeRefUsages > 0
+				? $"The reference is still used by {typeRefUsages} TypeRef(s) in the module. The AssemblyRef will be retained when saving. Remove or redirect those TypeRefs first."
+				: (string?)null,
+			Note = "Call save_assembly to write changes to disk."
+		}, opts);
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
+	/// <summary>
+	/// Detects and extracts Costura.Fody-embedded assemblies from ManifestResources.
+	/// Costura names them "costura.{name}.dll.compressed" (gzip) or "costura.{name}.dll".
+	/// Arguments: assembly_name, output_directory, decompress (opt bool, default true)
+	/// </summary>
+	public CallToolResult ExtractCostura(Dictionary<string, object>? arguments) {
+		if (arguments == null)
+			throw new ArgumentException("Arguments required");
+		if (!arguments.TryGetValue("assembly_name", out var asmNameObj))
+			throw new ArgumentException("assembly_name is required");
+		if (!arguments.TryGetValue("output_directory", out var outDirObj))
+			throw new ArgumentException("output_directory is required");
+
+		var assembly = FindAssemblyByName(asmNameObj.ToString() ?? "");
+		if (assembly == null)
+			throw new ArgumentException($"Assembly not found: {asmNameObj}");
+
+		var outDir = outDirObj.ToString() ?? "";
+		Directory.CreateDirectory(outDir);
+
+		bool decompress = GetBoolArg(arguments, "decompress", true);
+		var module = assembly.ManifestModule;
+
+		var extracted = new List<object>();
+		var skipped   = new List<string>();
+
+		foreach (var resource in module.Resources) {
+			var name = resource.Name.String;
+			if (!name.StartsWith("costura.", StringComparison.OrdinalIgnoreCase))
+				continue;
+
+			if (resource is not EmbeddedResource er) {
+				skipped.Add($"{name} (not an EmbeddedResource)");
+				continue;
+			}
+
+			var rawData = er.CreateReader().ToArray();
+			bool isCompressed = name.EndsWith(".compressed", StringComparison.OrdinalIgnoreCase);
+
+			// Determine output filename: strip "costura." prefix and ".compressed" suffix
+			var outName = name.Substring("costura.".Length);
+			if (outName.EndsWith(".compressed", StringComparison.OrdinalIgnoreCase))
+				outName = outName.Substring(0, outName.Length - ".compressed".Length);
+
+			var outPath = Path.Combine(outDir, outName);
+			var outData = rawData;
+			var method  = "raw";
+
+			if (isCompressed && decompress) {
+				try {
+					using var inMs  = new MemoryStream(rawData);
+					using var gz    = new GZipStream(inMs, CompressionMode.Decompress);
+					using var outMs = new MemoryStream();
+					gz.CopyTo(outMs);
+					outData = outMs.ToArray();
+					method  = "gzip-decompressed";
+				}
+				catch (Exception ex) {
+					method = $"raw (gzip failed: {ex.Message})";
+				}
+			}
+
+			File.WriteAllBytes(outPath, outData);
+			extracted.Add(new {
+				ResourceName         = name,
+				OutputFile           = outPath,
+				CompressedSizeBytes  = rawData.Length,
+				ExtractedSizeBytes   = outData.Length,
+				Method               = method
+			});
+		}
+
+		var result = JsonSerializer.Serialize(new {
+			Assembly        = assembly.Name.String,
+			OutputDirectory = outDir,
+			Extracted       = extracted,
+			Skipped         = skipped,
+			Summary = extracted.Count == 0
+				? "No Costura resources found. Use list_resources to inspect all resources."
+				: $"Extracted {extracted.Count} Costura-embedded file(s)."
+		}, new JsonSerializerOptions { WriteIndented = true });
+
+		return new CallToolResult {
+			Content = new List<ToolContent> { new ToolContent { Text = result } }
+		};
+	}
+
 	/// <summary>
 	/// Deep-clones a type from an external DLL file into the target assembly.
 	/// Copies fields, methods (with IL body), properties, and events.
@@ -1304,10 +1659,18 @@ namespace dnSpy.MCP.Server.Application {
 			_ => throw new ArgumentException($"Invalid visibility: '{visibility}'. Use public/private/protected/internal/protected_internal/private_protected.")
 		};
 
-		AssemblyDef? FindAssemblyByName(string name) =>
-			documentTreeView.GetAllModuleNodes()
+		AssemblyDef? FindAssemblyByName(string name, string? filePath = null) {
+			if (!string.IsNullOrEmpty(filePath)) {
+				var normalized = filePath!.Replace('/', '\\');
+				var byPath = documentTreeView.GetAllModuleNodes()
+					.FirstOrDefault(m => (m.Document?.Filename ?? "").Replace('/', '\\')
+						.Equals(normalized, StringComparison.OrdinalIgnoreCase));
+				if (byPath?.Document?.AssemblyDef != null) return byPath.Document.AssemblyDef;
+			}
+			return documentTreeView.GetAllModuleNodes()
 				.Select(m => m.Document?.AssemblyDef)
 				.FirstOrDefault(a => a != null && a.Name.String.Equals(name, StringComparison.OrdinalIgnoreCase));
+		}
 
 		TypeDef? FindTypeInAssembly(AssemblyDef assembly, string fullName) =>
 			assembly.Modules

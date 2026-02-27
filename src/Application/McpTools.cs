@@ -161,22 +161,15 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "decompile_method",
-                    Description = "Decompile a specific method to C# code",
+                    Description = "Decompile a specific method to C# code. Preferred over decompile_type for large types (avoids OOM). Use file_path to disambiguate when multiple assemblies share the same name.",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
-                            ["assembly_name"] = new Dictionary<string, object> {
-                                ["type"] = "string",
-                                ["description"] = "Name of the assembly"
-                            },
-                            ["type_full_name"] = new Dictionary<string, object> {
-                                ["type"] = "string",
-                                ["description"] = "Full name of the type"
-                            },
-                            ["method_name"] = new Dictionary<string, object> {
-                                ["type"] = "string",
-                                ["description"] = "Name of the method"
-                            }
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the declaring type (e.g. 'AA9A3FB8' or 'MyNamespace.MyClass')" },
+                            ["method_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the method (e.g. 'Main', '.ctor', or obfuscated names like '3392BA2B')" },
+                            ["file_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full path of the assembly file (optional; used to disambiguate when multiple assemblies share the same name)" },
+                            ["signature"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full method signature to select a specific overload (optional, e.g. 'System.Void AA9A3FB8::3392BA2B(System.Object,System.Int32)')" }
                         },
                         ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
                     }
@@ -387,12 +380,13 @@ namespace dnSpy.MCP.Server.Application
                 // ── Edit Tools ──────────────────────────────────────────────────────
                 new ToolInfo {
                     Name = "decompile_type",
-                    Description = "Decompile an entire type (class/struct/interface/enum) to C# source code",
+                    Description = "Decompile an entire type (class/struct/interface/enum) to C# source code. Use file_path to disambiguate when multiple assemblies share the same name.",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
                             ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
-                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type (e.g. MyNamespace.MyClass)" }
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type (e.g. MyNamespace.MyClass)" },
+                            ["file_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full file path to the assembly (optional; used to disambiguate when multiple assemblies share the same name)" }
                         },
                         ["required"] = new List<string> { "assembly_name", "type_full_name" }
                     }
@@ -614,14 +608,15 @@ namespace dnSpy.MCP.Server.Application
                 },
                 new ToolInfo {
                     Name = "set_breakpoint",
-                    Description = "Set a breakpoint at a method entry point (or specific IL offset). The breakpoint persists across debug sessions.",
+                    Description = "Set a breakpoint at a method entry point (or specific IL offset). The breakpoint persists across debug sessions. Use file_path to select the right assembly when multiple share the same name.",
                     InputSchema = new Dictionary<string, object> {
                         ["type"] = "object",
                         ["properties"] = new Dictionary<string, object> {
                             ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the assembly" },
-                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type" },
+                            ["type_full_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full name of the type (supports nested types, e.g. 'AA9A3FB8')" },
                             ["method_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Name of the method" },
-                            ["il_offset"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "IL offset within the method body (default 0 = method entry)" }
+                            ["il_offset"] = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "IL offset within the method body (default 0 = method entry)" },
+                            ["file_path"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Full path to the assembly file (optional; disambiguates when multiple assemblies share the same name)" }
                         },
                         ["required"] = new List<string> { "assembly_name", "type_full_name", "method_name" }
                     }
@@ -1045,6 +1040,20 @@ namespace dnSpy.MCP.Server.Application
                         ["required"] = new List<string> { "exe_path", "output_path" }
                     }
                 },
+                new ToolInfo {
+                    Name = "dump_cordbg_il",
+                    Description = "For each MethodDef in the paused module, reads ICorDebugFunction.ILCode.Address and ILCode.Size via the CorDebug API (through reflection). Reports whether IL addresses fall inside the PE image (mapped encrypted stubs) or outside (hook-decrypted CLR-internal buffers). Requires an active paused debug session. Useful for ConfuserEx JIT-hook analysis.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["module_name"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Module name or filename filter (default: first exe module)" },
+                            ["output_path"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Optional path to save full JSON results to disk" },
+                            ["max_methods"]   = new Dictionary<string, object> { ["type"] = "integer", ["description"] = "Max number of MethodDef tokens to scan (default 10000)" },
+                            ["include_bytes"] = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "If true, include base64-encoded IL bytes (from addr-12) for each method (default false)" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
 
                 // ── Config Management ─────────────────────────────────────────────────
                 new ToolInfo {
@@ -1132,6 +1141,86 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "file_path" }
                     }
+                },
+
+                // ── Embedded Resource Tools ───────────────────────────────────────────
+                new ToolInfo {
+                    Name = "list_resources",
+                    Description = "List all ManifestResource entries in an assembly: embedded resources, linked file references, and assembly-linked resources. Flags Costura.Fody-embedded assemblies (resources starting with 'costura.').",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly to inspect" }
+                        },
+                        ["required"] = new List<string> { "assembly_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_resource",
+                    Description = "Extract an embedded ManifestResource by name. Returns the raw bytes as Base64 (up to 4 MB inline) and optionally saves to disk. Use skip_base64=true when saving large resources to disk.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Assembly containing the resource" },
+                            ["resource_name"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Exact resource name (use list_resources to find it)" },
+                            ["output_path"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Optional absolute path to save the raw resource bytes to disk" },
+                            ["skip_base64"]   = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Omit Base64 payload from the response (default false)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "resource_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "add_resource",
+                    Description = "Embed a file from disk as a new EmbeddedResource (ManifestResource) in an assembly. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Target assembly" },
+                            ["resource_name"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Name for the new resource (e.g. MyApp.config or costura.foo.dll.compressed)" },
+                            ["file_path"]     = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Absolute path to the file to embed" },
+                            ["is_public"]     = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Resource visibility: true = Public (default), false = Private" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "resource_name", "file_path" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "remove_resource",
+                    Description = "Remove a ManifestResource entry from an assembly by name. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly containing the resource" },
+                            ["resource_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Exact resource name to remove (use list_resources to find it)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "resource_name" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "remove_assembly_reference",
+                    Description = "Remove an AssemblyRef entry and all associated TypeForwarder (ExportedType) entries that target it. If the reference is still used by TypeRefs in code, a warning is returned — those usages must also be removed before the reference disappears from the saved file. Changes are in-memory until save_assembly is called.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]  = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Assembly to modify" },
+                            ["reference_name"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Short name of the assembly reference to remove (e.g. System.Drawing)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "reference_name" }
+                    }
+                },
+
+                // ── Costura.Fody ──────────────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "extract_costura",
+                    Description = "Detect and extract assemblies embedded by Costura.Fody. Costura stores them as EmbeddedResources named 'costura.{name}.dll.compressed' (gzip-compressed) or 'costura.{name}.dll' (uncompressed). Also handles .pdb files. Writes each extracted file to the output directory.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["assembly_name"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Assembly that uses Costura.Fody (use list_resources to confirm costura.* resources exist)" },
+                            ["output_directory"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Directory where extracted DLLs and PDBs will be written (created if it does not exist)" },
+                            ["decompress"]       = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "Decompress gzip-compressed resources (default true)" }
+                        },
+                        ["required"] = new List<string> { "assembly_name", "output_directory" }
+                    }
                 }
             };
         }
@@ -1171,9 +1260,15 @@ namespace dnSpy.MCP.Server.Application
                     "get_assembly_metadata" => InvokeLazy(editTools, "GetAssemblyMetadata", arguments),
                     "edit_assembly_metadata" => InvokeLazy(editTools, "EditAssemblyMetadata", arguments),
                     "set_assembly_flags" => InvokeLazy(editTools, "SetAssemblyFlags", arguments),
-                    "list_assembly_references" => InvokeLazy(editTools, "ListAssemblyReferences", arguments),
-                    "add_assembly_reference" => InvokeLazy(editTools, "AddAssemblyReference", arguments),
-                    "inject_type_from_dll" => InvokeLazy(editTools, "InjectTypeFromDll", arguments),
+                    "list_assembly_references"  => InvokeLazy(editTools, "ListAssemblyReferences",  arguments),
+                    "add_assembly_reference"    => InvokeLazy(editTools, "AddAssemblyReference",    arguments),
+                    "remove_assembly_reference" => InvokeLazy(editTools, "RemoveAssemblyReference", arguments),
+                    "list_resources"            => InvokeLazy(editTools, "ListResources",            arguments),
+                    "get_resource"              => InvokeLazy(editTools, "GetResource",              arguments),
+                    "add_resource"              => InvokeLazy(editTools, "AddResource",              arguments),
+                    "remove_resource"           => InvokeLazy(editTools, "RemoveResource",           arguments),
+                    "extract_costura"           => InvokeLazy(editTools, "ExtractCostura",           arguments),
+                    "inject_type_from_dll"      => InvokeLazy(editTools, "InjectTypeFromDll",        arguments),
                     "list_pinvoke_methods" => InvokeLazy(editTools, "ListPInvokeMethods", arguments),
                     "patch_method_to_ret" => InvokeLazy(editTools, "PatchMethodToRet", arguments),
                     "list_events_in_type" => InvokeLazy(editTools, "ListEventsInType", arguments),
@@ -1219,6 +1314,7 @@ namespace dnSpy.MCP.Server.Application
                     "start_debugging"    => InvokeLazy(debugTools, "StartDebugging",  arguments),
                     "attach_to_process"  => InvokeLazy(debugTools, "AttachToProcess", arguments),
                     "unpack_from_memory" => InvokeLazy(dumpTools,  "UnpackFromMemory", arguments),
+                    "dump_cordbg_il"     => InvokeLazy(dumpTools,  "DumpCordbgIL",    arguments),
 
                     // Debug tools
                     "get_debugger_state" => InvokeLazy(debugTools, "GetDebuggerState", arguments),

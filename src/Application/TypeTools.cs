@@ -155,7 +155,15 @@ namespace dnSpy.MCP.Server.Application
             var typeFullName = typeNameObj.ToString() ?? string.Empty;
             var methodName = methodNameObj.ToString() ?? string.Empty;
 
-            var assembly = FindAssemblyByName(assemblyName);
+            string? filePath = null;
+            if (arguments.TryGetValue("file_path", out var fpObj))
+                filePath = fpObj?.ToString();
+
+            string? signature = null;
+            if (arguments.TryGetValue("signature", out var sigObj))
+                signature = sigObj?.ToString();
+
+            var assembly = FindAssemblyByName(assemblyName, filePath);
             if (assembly == null)
                 throw new ArgumentException($"Assembly not found: {assemblyName}");
 
@@ -163,23 +171,39 @@ namespace dnSpy.MCP.Server.Application
             if (type == null)
                 throw new ArgumentException($"Type not found: {typeFullName}");
 
-            var method = type.Methods.FirstOrDefault(m => m.Name == methodName);
-            if (method == null)
-                throw new ArgumentException($"Method not found: {methodName}");
+            var candidates = type.Methods.Where(m => m.Name.String.Equals(methodName, StringComparison.Ordinal)).ToList();
+            if (candidates.Count == 0)
+                throw new ArgumentException($"Method '{methodName}' not found in type '{type.FullName}'.");
+
+            List<MethodDef> targets;
+            if (!string.IsNullOrEmpty(signature)) {
+                var specific = candidates.FirstOrDefault(m => m.FullName.Equals(signature, StringComparison.Ordinal));
+                if (specific == null)
+                    throw new ArgumentException(
+                        $"No overload matching signature '{signature}'. Available:\n" +
+                        string.Join("\n", candidates.Select(m => m.FullName)));
+                targets = new List<MethodDef> { specific };
+            }
+            else {
+                targets = candidates;
+            }
 
             var decompiler = decompilerService.Decompiler;
-            var output = new StringBuilderDecompilerOutput();
-            var decompilationContext = new DecompilationContext
-            {
-                CancellationToken = System.Threading.CancellationToken.None
-            };
+            var ctx = new DecompilationContext { CancellationToken = System.Threading.CancellationToken.None };
+            var sb = new System.Text.StringBuilder();
 
-            decompiler.Decompile(method, output, decompilationContext);
+            foreach (var method in targets) {
+                var output = new StringBuilderDecompilerOutput();
+                decompiler.Decompile(method, output, ctx);
+                if (targets.Count > 1)
+                    sb.AppendLine($"// Overload: {method.FullName}");
+                sb.AppendLine(output.ToString());
+            }
 
             return new CallToolResult
             {
                 Content = new List<ToolContent> {
-                    new ToolContent { Text = output.ToString() }
+                    new ToolContent { Text = sb.ToString() }
                 }
             };
         }
@@ -550,8 +574,15 @@ namespace dnSpy.MCP.Server.Application
             return null;
         }
 
-        AssemblyDef? FindAssemblyByName(string name)
+        AssemblyDef? FindAssemblyByName(string name, string? filePath = null)
         {
+            if (!string.IsNullOrEmpty(filePath)) {
+                var normalized = filePath!.Replace('/', '\\');
+                var byPath = documentTreeView.GetAllModuleNodes()
+                    .FirstOrDefault(m => (m.Document?.Filename ?? "").Replace('/', '\\')
+                        .Equals(normalized, StringComparison.OrdinalIgnoreCase));
+                if (byPath?.Document?.AssemblyDef != null) return byPath.Document.AssemblyDef;
+            }
             return documentTreeView.GetAllModuleNodes()
                 .Select(m => m.Document?.AssemblyDef)
                 .FirstOrDefault(a => a != null && a.Name.String.Equals(name, StringComparison.OrdinalIgnoreCase));
@@ -559,9 +590,19 @@ namespace dnSpy.MCP.Server.Application
 
         TypeDef? FindTypeInAssembly(AssemblyDef assembly, string fullName)
         {
+            // Search both top-level and nested types
             return assembly.Modules
-                .SelectMany(m => m.Types)
+                .SelectMany(m => GetAllTypesRecursive(m.Types))
                 .FirstOrDefault(t => t.FullName.Equals(fullName, StringComparison.Ordinal));
+        }
+
+        static IEnumerable<TypeDef> GetAllTypesRecursive(IEnumerable<TypeDef> types)
+        {
+            foreach (var t in types) {
+                yield return t;
+                foreach (var n in GetAllTypesRecursive(t.NestedTypes))
+                    yield return n;
+            }
         }
 
         string EncodeCursor(int offset, int pageSize)
@@ -662,7 +703,11 @@ namespace dnSpy.MCP.Server.Application
             var typeFullName = typeNameObj.ToString() ?? string.Empty;
             var methodName = methodNameObj.ToString() ?? string.Empty;
 
-            var assembly = FindAssemblyByName(assemblyName);
+            string? filePath = null;
+            if (arguments.TryGetValue("file_path", out var fpObj2))
+                filePath = fpObj2?.ToString();
+
+            var assembly = FindAssemblyByName(assemblyName, filePath);
             if (assembly == null)
                 throw new ArgumentException($"Assembly not found: {assemblyName}");
 
@@ -675,7 +720,14 @@ namespace dnSpy.MCP.Server.Application
                 throw new ArgumentException($"Method not found: {methodName}");
 
             if (method.Body == null)
-                throw new ArgumentException($"Method has no body (abstract or native)");
+                return new CallToolResult {
+                    Content = new List<ToolContent> {
+                        new ToolContent {
+                            Text = $"Method '{method.FullName}' has no IL body (abstract, extern, or encrypted).\n" +
+                                   $"Attributes: {method.Attributes}\nImplAttributes: {method.ImplAttributes}"
+                        }
+                    }
+                };
 
             var instructions = method.Body.Instructions;
             var ilInstructions = new List<object>();
