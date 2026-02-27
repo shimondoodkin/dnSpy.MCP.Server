@@ -1,20 +1,20 @@
 /*
-    Copyright (C) 2014-2019 de4dot@gmail.com
+    Copyright (C) 2026 @chichicaste
 
-    This file is part of dnSpy
+    This file is part of dnSpy MCP Server module. 
 
-    dnSpy is free software: you can redistribute it and/or modify
+    dnSpy MCP Server is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
-    dnSpy is distributed in the hope that it will be useful,
+    dnSpy MCP Server is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with dnSpy.  If not, see <http://www.gnu.org/licenses/>.
+    along with dnSpy MCP Server.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 using System;
@@ -50,6 +50,7 @@ namespace dnSpy.MCP.Server.Application
         readonly Lazy<CodeAnalysisHelpers> codeAnalysisTools;
         readonly Lazy<De4dotExeTool> de4dotExeTool;
         readonly Lazy<De4dotTools> de4dotTools;
+        readonly Lazy<SkillsTools> skillsTools;
 
         [ImportingConstructor]
         public McpTools(
@@ -64,7 +65,8 @@ namespace dnSpy.MCP.Server.Application
             Lazy<UsageFindingCommandTools> usageFindingTools,
             Lazy<CodeAnalysisHelpers> codeAnalysisTools,
             Lazy<De4dotExeTool> de4dotExeTool,
-            Lazy<De4dotTools> de4dotTools
+            Lazy<De4dotTools> de4dotTools,
+            Lazy<SkillsTools> skillsTools
             )
         {
             this.documentTreeView = documentTreeView;
@@ -79,6 +81,7 @@ namespace dnSpy.MCP.Server.Application
             this.codeAnalysisTools = codeAnalysisTools;
             this.de4dotExeTool = de4dotExeTool;
             this.de4dotTools = de4dotTools;
+            this.skillsTools = skillsTools;
         }
 
         public List<ToolInfo> GetAvailableTools()
@@ -1221,6 +1224,71 @@ namespace dnSpy.MCP.Server.Application
                         },
                         ["required"] = new List<string> { "assembly_name", "output_directory" }
                     }
+                },
+
+                // ── Skills knowledge base ─────────────────────────────────────────────
+                new ToolInfo {
+                    Name = "list_skills",
+                    Description = "List all reverse-engineering skills/procedures in the knowledge base. Each skill has a Markdown narrative and a JSON technical record stored in %APPDATA%\\dnSpy\\dnSpy.MCPServer\\skills\\.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["tag"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional tag filter (case-insensitive substring match, e.g. 'packer')" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "get_skill",
+                    Description = "Retrieve the full content (Markdown narrative + JSON technical record) of a skill by ID.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["skill_id"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Skill ID slug (e.g. 'confuserex-unpacking'). Use list_skills to see available IDs." }
+                        },
+                        ["required"] = new List<string> { "skill_id" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "save_skill",
+                    Description = "Create or update a skill in the knowledge base. Writes a Markdown narrative and/or JSON technical record with step-by-step procedures, magic values, crypto keys, prompts, and findings. Use merge=true to append new findings without overwriting existing data.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["skill_id"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Skill ID (will be slugified). Use a descriptive name like 'confuserex-unpacking'." },
+                            ["name"]        = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Human-readable name for the skill" },
+                            ["description"] = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Short description of what this skill covers" },
+                            ["tags"]        = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Comma-separated or JSON array of tags (e.g. 'packer,confuserex,unpacking')" },
+                            ["targets"]     = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Comma-separated or JSON array of target assembly names / binary hashes this skill applies to" },
+                            ["markdown"]    = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "Markdown narrative: what to do, why, key observations, and procedure steps in prose" },
+                            ["json_data"]   = new Dictionary<string, object> { ["type"] = "string",  ["description"] = "JSON string with technical details: procedure steps (tool+prompt+expected), magic_values, crypto_keys, algorithms, offsets, findings, generic prompts (identify/apply/verify/troubleshoot)" },
+                            ["merge"]       = new Dictionary<string, object> { ["type"] = "boolean", ["description"] = "If true, deep-merge json_data into the existing record instead of replacing it. Use to add new findings without losing old ones (default false)." }
+                        },
+                        ["required"] = new List<string> { "skill_id" }
+                    }
+                },
+                new ToolInfo {
+                    Name = "search_skills",
+                    Description = "Full-text search across all skill Markdown and JSON files. Returns matching skills with context snippets. Provide query, tag, or both.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["query"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Keyword or phrase to search for in skill Markdown and JSON content" },
+                            ["tag"]   = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Optional tag filter (combined with query if both provided)" }
+                        },
+                        ["required"] = new List<string>()
+                    }
+                },
+                new ToolInfo {
+                    Name = "delete_skill",
+                    Description = "Permanently delete a skill (both Markdown and JSON files) from the knowledge base.",
+                    InputSchema = new Dictionary<string, object> {
+                        ["type"] = "object",
+                        ["properties"] = new Dictionary<string, object> {
+                            ["skill_id"] = new Dictionary<string, object> { ["type"] = "string", ["description"] = "Skill ID to delete. Use list_skills to see available IDs." }
+                        },
+                        ["required"] = new List<string> { "skill_id" }
+                    }
                 }
             };
         }
@@ -1338,6 +1406,13 @@ namespace dnSpy.MCP.Server.Application
                     "detect_obfuscator"     => InvokeLazy(de4dotTools, "DetectObfuscator",     arguments),
                     "deobfuscate_assembly"  => InvokeLazy(de4dotTools, "DeobfuscateAssembly",  arguments),
                     "save_deobfuscated"     => InvokeLazy(de4dotTools, "SaveDeobfuscated",     arguments),
+
+                    // Skills knowledge base
+                    "list_skills"   => InvokeLazy(skillsTools, "ListSkills",   arguments),
+                    "get_skill"     => InvokeLazy(skillsTools, "GetSkill",     arguments),
+                    "save_skill"    => InvokeLazy(skillsTools, "SaveSkill",    arguments),
+                    "search_skills" => InvokeLazy(skillsTools, "SearchSkills", arguments),
+                    "delete_skill"  => InvokeLazy(skillsTools, "DeleteSkill",  arguments),
 
                     _ => new CallToolResult
                     {
