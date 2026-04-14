@@ -1,0 +1,81 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        configuration: [Release]
+        framework: [net10.0-windows, net48]
+
+    steps:
+      - name: Clone dnSpy (with submodules)
+        run: git clone https://github.com/dnSpyEx/dnSpy --recursive --depth 1
+
+      - name: Checkout dnSpy.MCP.Server
+        uses: actions/checkout@v4
+        with:
+          path: dnSpy/Extensions/dnSpy.MCP.Server
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Restore NuGet packages
+        working-directory: dnSpy
+        run: dotnet restore Extensions/dnSpy.MCP.Server/dnSpy.MCP.Server.csproj
+
+      - name: Build (${{ matrix.framework }}, ${{ matrix.configuration }})
+        working-directory: dnSpy
+        run: dotnet build Extensions/dnSpy.MCP.Server/dnSpy.MCP.Server.csproj -c ${{ matrix.configuration }} -f ${{ matrix.framework }} --no-restore
+
+      - name: Collect build output
+        shell: bash
+        run: |
+          mkdir -p staging
+          framework="${{ matrix.framework }}"
+          short_name="${framework//./}"
+          cp dnSpy/dnSpy/dnSpy/bin/${{ matrix.configuration }}/${{ matrix.framework }}/dnSpy.MCP.Server.x.dll \
+             "staging/dnSpy.MCP.Server.x-${short_name}.dll"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnSpy.MCP.Server-${{ matrix.framework }}
+          path: staging/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout (for release notes)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.dll
