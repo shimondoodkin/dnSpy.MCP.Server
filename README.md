@@ -1,5 +1,7 @@
 # dnSpy MCP Server
 
+
+
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedded in dnSpy that exposes full .NET assembly analysis, editing, debugging, memory-dump, and deobfuscation capabilities to any MCP-compatible AI assistant.
 
 **Version**: 1.6.0 | **Tools**: 95 | **Status**: ✅ 0 errors, 0 warnings | **Targets**: .NET 4.8 + .NET 10.0-windows
@@ -9,9 +11,10 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
 ## Table of Contents
 
 1. [Features](#features)
-2. [Build & Install](#build--install)
-3. [Client Configuration](#client-configuration)
-4. [Tool Reference](#tool-reference)
+2. [Quick start](#quick-start)
+3. [Build & Install](#build--install)
+4. [Client Configuration](#client-configuration)
+5. [Tool Reference](#tool-reference)
    - [Assembly Tools](#assembly-tools)
    - [Type & Member Tools](#type--member-tools)
    - [Method & Decompilation Tools](#method--decompilation-tools)
@@ -25,13 +28,13 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
    - [Deobfuscation Tools](#deobfuscation-tools)
    - [Window / Dialog Tools](#window--dialog-tools)
    - [Utility](#utility)
-5. [Pattern Syntax](#pattern-syntax)
-6. [Pagination](#pagination)
-7. [Usage Examples](#usage-examples)
-8. [Architecture](#architecture)
-9. [Project Structure](#project-structure)
-10. [Configuration](#configuration)
-11. [Troubleshooting](#troubleshooting)
+6. [Pattern Syntax](#pattern-syntax)
+7. [Pagination](#pagination)
+8. [Usage Examples](#usage-examples)
+9. [Architecture](#architecture)
+10. [Project Structure](#project-structure)
+11. [Configuration](#configuration)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -52,6 +55,40 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server embedd
 | **Deobfuscation** | de4dot integration: detect obfuscator, rename mangled symbols, decrypt strings. Both in-process (`deobfuscate_assembly`) and external process (`run_de4dot`) modes available in all builds |
 | **Window / Dialog** | List active dialog/message-box windows (Win32 `#32770` + WPF) in the dnSpy process; dismiss them by clicking any button by name (supports EN and ES) |
 | **Search** | Glob and regex search across all loaded assemblies |
+
+---
+
+## Quick start
+
+1. download dnspy
+   https://github.com/rhsCZ/dnSpy/releases
+
+2. download mcp server
+   download from releaases dotnet 10 dll
+   https://github.com/shimondoodkin/dnSpy.MCP.Server/releases
+
+3. put the .x.dll in bin folder of dnspay (extention dlls end with .x.dll) use it.
+
+4. in debug menu there is start mcp server.
+
+5. and in options option to change port.
+
+6. example `.mcp.json` file to put in work folder
+
+ .mcp.json
+```
+{
+  "mcpServers": {
+    "dnspy": {
+      "type": "sse",
+      "url": "http://localhost:3100/sse"
+    }
+  }
+}
+
+```
+
+in claude code type /mcp and see if it is connected
 
 ---
 
