@@ -48,7 +48,7 @@ jobs:
           framework="${{ matrix.framework }}"
           short_name="${framework//./}"
           cp dnSpy/dnSpy/dnSpy/bin/${{ matrix.configuration }}/${{ matrix.framework }}/dnSpy.MCP.Server.x.dll \
-             "staging/dnSpy.MCP.Server.x-${short_name}.dll"
+             "staging/dnSpy.MCP.Server-${short_name}.x.dll"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
