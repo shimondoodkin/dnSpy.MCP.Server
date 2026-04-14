@@ -43,6 +43,9 @@ namespace dnSpy.MCP.Server.Communication {
 		readonly McpTools tools;
 		readonly BepInExResources bepinexResources;
 		HttpListener? httpListener;
+		Task? acceptLoopTask;
+		Mutex? portMutex;
+		readonly object serverLock = new object();
 		readonly List<SseClient> sseClients = new List<SseClient>();
 		readonly Dictionary<string, SseClient> sessionClients = new Dictionary<string, SseClient>();
 		readonly object sseClientsLock = new object();
@@ -70,49 +73,110 @@ namespace dnSpy.MCP.Server.Communication {
 		/// Starts the MCP server if enabled in settings.
 		/// </summary>
 		public void Start() {
-			McpLogger.Debug($"Start() called - EnableServer={settings.EnableServer}");
+			lock (serverLock) {
+				McpLogger.Debug($"Start() called - EnableServer={settings.EnableServer}");
 
-			if (!settings.EnableServer) {
-				McpLogger.Info("Server not enabled in settings - skipping start");
-				return;
+				if (!settings.EnableServer) {
+					McpLogger.Info("Server not enabled in settings - skipping start");
+					return;
+				}
+
+				if (httpListener != null) {
+					McpLogger.Warning($"Server is already running on {settings.Host}:{settings.Port}");
+					return;
+				}
+
+				McpLogger.Info($"═══════════════════════════════════════════════════════");
+				McpLogger.Info($"Starting MCP Server");
+				McpLogger.Info($"Host: {settings.Host}");
+				McpLogger.Info($"Port: {settings.Port}");
+				McpLogger.Info($"═══════════════════════════════════════════════════════");
+
+				try {
+					cts = new CancellationTokenSource();
+
+					// Safety net: ensure cleanup runs even if dnSpy crashes or is killed
+					AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+					AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+
+					StartHttpListenerServer();
+				}
+				catch (Exception ex) {
+					McpLogger.Exception(ex, "Failed to start server");
+				}
 			}
+		}
 
-			if (httpListener != null) {
-				McpLogger.Warning($"Server is already running on {settings.Host}:{settings.Port}");
-				return;
-			}
-
-			McpLogger.Info($"═══════════════════════════════════════════════════════");
-			McpLogger.Info($"Starting MCP Server");
-			McpLogger.Info($"Host: {settings.Host}");
-			McpLogger.Info($"Port: {settings.Port}");
-			McpLogger.Info($"═══════════════════════════════════════════════════════");
-
+		void OnProcessExit(object? sender, EventArgs e) {
 			try {
-				cts = new CancellationTokenSource();
+				McpLogger.Info("ProcessExit detected — cleaning up MCP server");
+				Stop();
+			}
+			catch {
+				// Best effort during process teardown
+			}
+		}
 
-				StartHttpListenerServer();
+		/// <summary>
+		/// Tries to acquire a named mutex for the given port.
+		/// If acquired, no other dnSpy instance owns this port → safe to bind.
+		/// If not acquired, another live instance holds the port → skip to next port.
+		/// A stale HTTP.sys registration (crashed process) has an abandoned mutex
+		/// which we can acquire, then re-bind the port.
+		/// </summary>
+		bool TryAcquirePortMutex(int port, out Mutex? mutex) {
+			var mutexName = $"Global\\dnSpy.MCP.Server.Port.{port}";
+			try {
+				mutex = new Mutex(false, mutexName);
+				// Try to acquire with no wait
+				if (mutex.WaitOne(0)) {
+					McpLogger.Debug($"Acquired port mutex for port {port}");
+					return true;
+				}
+				// Another live instance holds this port
+				McpLogger.Debug($"Port {port} is owned by another dnSpy instance");
+				mutex.Dispose();
+				mutex = null;
+				return false;
+			}
+			catch (AbandonedMutexException) {
+				// Previous process crashed without releasing — we now own the mutex.
+				// The HTTP.sys registration is stale and will be replaced when we bind.
+				McpLogger.Warning($"Port {port} had an abandoned mutex (previous instance crashed). Reclaiming.");
+				mutex = new Mutex(false, mutexName);
+				mutex.WaitOne(0); // re-acquire cleanly
+				return true;
 			}
 			catch (Exception ex) {
-				McpLogger.Exception(ex, "Failed to start server");
+				McpLogger.Warning($"Could not check port mutex for {port}: {ex.Message}");
+				// Fall through — let HttpListener.Start() decide
+				mutex = null;
+				return true;
 			}
 		}
 
 		void StartHttpListenerServer() {
-			Task.Run(() => {
+			acceptLoopTask = Task.Run(async () => {
 				int port = settings.Port;
 				int maxAttempts = 10;
 				HttpListener? listener = null;
 				string? boundPrefix = null;
+				Mutex? acquiredMutex = null;
 
 				for (int attempt = 0; attempt < maxAttempts; attempt++) {
 					try {
 						int currentPort = port + attempt;
 						McpLogger.Debug($"Attempting to start HTTP server on port {currentPort}");
 
+						// Check if another live dnSpy instance owns this port
+						if (!TryAcquirePortMutex(currentPort, out acquiredMutex)) {
+							McpLogger.Debug($"Port {currentPort} owned by another instance, trying next...");
+							continue;
+						}
+
 						listener = new HttpListener();
 						boundPrefix = $"http://localhost:{currentPort}/";
-						
+
 						try {
 							listener.Prefixes.Add(boundPrefix);
 						}
@@ -120,21 +184,25 @@ namespace dnSpy.MCP.Server.Communication {
 							McpLogger.Debug($"Failed to add prefix {boundPrefix}: {ex.Message}");
 							listener.Close();
 							listener = null;
+							acquiredMutex?.ReleaseMutex();
+							acquiredMutex?.Dispose();
+							acquiredMutex = null;
 							continue;
 						}
-						
+
 						listener.Start();
-						
+
 						// Success!
 						port = currentPort;
 						httpListener = listener;
-						
+						portMutex = acquiredMutex;
+
 						McpLogger.Info($"HttpListener server started on localhost:{port}");
-						
+
 						if (attempt > 0) {
 							McpLogger.Info($"Note: Original port {settings.Port} was in use, using port {port} instead");
 						}
-						
+
 						McpLogger.Info("Server is ready to accept connections");
 						BroadcastStatus("running");
 						break;
@@ -142,18 +210,26 @@ namespace dnSpy.MCP.Server.Communication {
 					catch (HttpListenerException ex) when (ex.ErrorCode == 5) {
 						// Access denied - no point trying other ports
 						McpLogger.Exception(ex, $"Access denied to port {port}. Try running: netsh http add urlacl url=http://localhost:{port}/ user=Everyone");
+						acquiredMutex?.ReleaseMutex();
+						acquiredMutex?.Dispose();
 						break;
 					}
 					catch (HttpListenerException) {
-						// Port in use, try next one
+						// Port in use by a non-dnSpy process, try next one
 						McpLogger.Debug($"Port {port + attempt} is in use, trying next...");
 						listener?.Close();
 						listener = null;
+						acquiredMutex?.ReleaseMutex();
+						acquiredMutex?.Dispose();
+						acquiredMutex = null;
 					}
 					catch (Exception ex) {
 						McpLogger.Exception(ex, $"Error starting HttpListener on port {port + attempt}");
 						listener?.Close();
 						listener = null;
+						acquiredMutex?.ReleaseMutex();
+						acquiredMutex?.Dispose();
+						acquiredMutex = null;
 						break;
 					}
 				}
@@ -163,17 +239,28 @@ namespace dnSpy.MCP.Server.Communication {
 					return;
 				}
 
-				while (!cts!.Token.IsCancellationRequested) {
+				var token = cts!.Token;
+				while (!token.IsCancellationRequested) {
 					try {
-						var context = httpListener.GetContext();
+						// Use async accept — properly cancellable via httpListener.Stop()
+						var context = await httpListener.GetContextAsync().ConfigureAwait(false);
 						McpLogger.Debug($"Accepted connection from {context.Request.RemoteEndPoint}");
-						Task.Run(() => HandleHttpRequest(context), cts.Token);
+						_ = Task.Run(() => HandleHttpRequest(context), token);
 					}
 					catch (HttpListenerException) {
 						McpLogger.Debug("HttpListener stopped (expected during shutdown)");
 						break;
 					}
+					catch (ObjectDisposedException) {
+						McpLogger.Debug("HttpListener disposed (expected during shutdown)");
+						break;
+					}
+					catch (OperationCanceledException) {
+						break;
+					}
 					catch (Exception ex) {
+						if (token.IsCancellationRequested)
+							break;
 						McpLogger.Exception(ex, "Error accepting HTTP request");
 					}
 				}
@@ -331,36 +418,56 @@ namespace dnSpy.MCP.Server.Communication {
 		/// Stops the MCP server if it's running.
 		/// </summary>
 		public void Stop() {
-			McpLogger.Info("Stopping MCP server...");
-			try {
-				cts?.Cancel();
-				
-				// Force close the HttpListener to release the port
-				if (httpListener != null) {
-					try {
-						httpListener.Stop();
+			lock (serverLock) {
+				McpLogger.Info("Stopping MCP server...");
+				try {
+					AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+					cts?.Cancel();
+
+					// Force close the HttpListener to unblock GetContextAsync and release the port
+					if (httpListener != null) {
+						try {
+							httpListener.Stop();
+						}
+						catch { }
+						try {
+							httpListener.Abort();
+						}
+						catch { }
+						httpListener.Close();
+						httpListener = null;
 					}
-					catch { }
-					try {
-						httpListener.Abort();
+
+					// Wait for the accept loop to exit so the port is fully released
+					// before any subsequent Start() call
+					if (acceptLoopTask != null) {
+						try {
+							acceptLoopTask.Wait(TimeSpan.FromSeconds(3));
+						}
+						catch { }
+						acceptLoopTask = null;
 					}
-					catch { }
-					httpListener.Close();
-					httpListener = null;
+
+					// Release the port mutex so another instance can claim this port
+					if (portMutex != null) {
+						try {
+							portMutex.ReleaseMutex();
+						}
+						catch { }
+						portMutex.Dispose();
+						portMutex = null;
+					}
+
+					CloseAllSseClients();
+					BroadcastStatus("stopped");
+
+					McpLogger.Info("MCP server stopped successfully");
+					cts?.Dispose();
+					cts = null;
 				}
-				
-				CloseAllSseClients();
-				BroadcastStatus("stopped");
-				
-				// Small delay to ensure port is released
-				Thread.Sleep(100);
-				
-				McpLogger.Info("MCP server stopped successfully");
-				cts?.Dispose();
-				cts = null;
-			}
-			catch (Exception ex) {
-				McpLogger.Exception(ex, "Error stopping server");
+				catch (Exception ex) {
+					McpLogger.Exception(ex, "Error stopping server");
+				}
 			}
 		}
 
